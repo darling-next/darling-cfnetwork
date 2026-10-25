@@ -1576,6 +1576,15 @@ static CFStreamError httpCreateConnectionStreams(CFAllocatorRef alloc, const voi
             err.error = ENOMEM;
             return err;
         }
+        /* SecureTransport snapshots the peer when SSL is configured, before
+         * the remaining connection properties are forwarded through filters. */
+        if (properties) {
+            CFStringRef peer = CFDictionaryGetValue(properties, _kCFStreamPropertySocketPeerName);
+            if (peer)
+                CFReadStreamSetProperty(rStream, _kCFStreamPropertySocketPeerName, peer);
+        }
+        if (connType == kHTTPS)
+            CFReadStreamSetProperty(rStream, kCFStreamPropertySocketSecurityLevel, kCFStreamSocketSecurityLevelNegotiatedSSL);
 		
 		callback = CFArrayCreate(alloc, values, sizeof(values) / sizeof(values[0]), &cb);
 		
@@ -1584,9 +1593,6 @@ static CFStreamError httpCreateConnectionStreams(CFAllocatorRef alloc, const voi
 			CFRelease(callback);
 		}
 
-        if (connType == kHTTPS) {
-            CFReadStreamSetProperty(rStream, kCFStreamPropertySocketSecurityLevel, kCFStreamSocketSecurityLevelNegotiatedSSL);
-        }
     }
 
     *requestStream = CFWriteStreamCreateHTTPStream(alloc, NULL, (connType == kHTTPProxy || connType == kHTTPSProxy), wStream);

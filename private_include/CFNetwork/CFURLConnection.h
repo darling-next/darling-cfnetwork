@@ -6,6 +6,7 @@
 #include "CFURLRequest.h"
 #include "CFURLResponse.h"
 #include "CFCachedURLResponse.h"
+#include <CFNetwork/CFHost.h>
 
 #if PRAGMA_ONCE
 #pragma once
@@ -61,6 +62,11 @@ Boolean CFURLConnectionSendSynchronousRequest(CFURLRequestRef request, CFDataRef
 void CFURLConnectionSendAsynchronousRequest(CFURLRequestRef request, void (^)(CFURLResponseRef, CFDataRef, CFErrorRef));
 void CFURLConnectionStart(CFURLConnectionRef connection);
 void CFURLConnectionCancel(CFURLConnectionRef connection);
+
+/* Darling transport extension, not an asserted Apple SPI. Creation-time only.
+ * Connect directly to host:port, retaining the request URL's HTTP/TLS identity.
+ */
+Boolean _CFURLConnectionSetSocketHostOverride(CFURLConnectionRef connection, CFHostRef host, SInt32 port);
 
 __END_DECLS
 

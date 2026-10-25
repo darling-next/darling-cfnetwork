@@ -13,6 +13,7 @@
 #include <CFNetwork/CFURLCache.h>
 #include "CFURLResponse.h"
 #include <CFNetwork/CFNetworkErrors.h>
+#include <CFNetwork/CFSocketStreamPriv.h>
 #include <stdlib.h>
 #include <libkern/OSAtomic.h>
 #include <CoreFoundation/CFBase.h>
@@ -23,6 +24,11 @@
 #include <pthread.h>
 #include "CFHTTPCookieStorage.h"
 #include "CFRuntimeUtils.h"
+
+/* Existing CFSocketStream.c implementation-private property keys. */
+#define _kCFStreamPropertyHostForOpen CFSTR("_kCFStreamPropertyHostForOpen")
+#define _kCFStreamPropertySocketRemotePort CFSTR("_kCFStreamPropertySocketRemotePort")
+#define _kCFURLConnectionSocketRemoteHost CFSTR("kCFStreamPropertySocketRemoteHost")
 
 #ifndef NDEBUG
 #define CACHE_LOG_ENABLED
@@ -147,6 +153,9 @@ struct _CFURLConnection {
     CFIndex redirectCycleCount;
     CFReadStreamRef stream;
     CFReadStreamRef replacementStream;
+    CFHostRef socketHostOverride;
+    SInt32 socketPortOverride;
+    Boolean started;
     CFURLResponseRef response;
     CFErrorRef error;
     ContentEncoding contentEncoding;
@@ -181,6 +190,8 @@ static void __CFURLConnectionDeallocate(CFTypeRef cf) {
         CFRelease(connection->request);
         connection->request = NULL;
     }
+    if (connection->socketHostOverride)
+        CFRelease(connection->socketHostOverride);
 
     if (connection->stream != NULL) {
         CFRelease(connection->stream);
@@ -316,6 +327,34 @@ static void noopAuth(const void *info, CFURLAuthChallengeRef challenge) {
 
 static Boolean noopCredentialStorage(const void *info) {
     return true;
+}
+
+/* Keep transport destination separate from URL/Host and certificate identity.
+ * A fresh CFHost per stream prevents redirect teardown from invalidating the
+ * next stream's asynchronous hostname lookup.
+ */
+static Boolean setSocketHostOverride(CFReadStreamRef stream, CFURLRequestRef request,
+                                    CFHostRef host, SInt32 port) {
+    CFHostRef streamHost = CFHostCreateCopy(kCFAllocatorDefault, host);
+    CFStringRef peer = CFURLCopyHostName(CFURLRequestGetURL(request));
+    CFNumberRef portNumber = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &port);
+    CFDictionaryRef direct = CFDictionaryCreate(kCFAllocatorDefault, NULL, NULL, 0,
+        &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    Boolean resolved = false;
+    CFArrayRef addresses = streamHost ? CFHostGetAddressing(streamHost, &resolved) : NULL;
+    CFStringRef hostProperty = resolved && addresses
+        ? _kCFStreamPropertyHostForOpen : _kCFURLConnectionSocketRemoteHost;
+    /* An explicit destination is direct, not a request to connect to a proxy. */
+    Boolean result = stream && streamHost && peer && portNumber && direct &&
+        CFReadStreamSetProperty(stream, kCFStreamPropertyHTTPProxy, direct) &&
+        CFReadStreamSetProperty(stream, hostProperty, streamHost) &&
+        CFReadStreamSetProperty(stream, _kCFStreamPropertySocketRemotePort, portNumber) &&
+        CFReadStreamSetProperty(stream, _kCFStreamPropertySocketPeerName, peer);
+    if (direct) CFRelease(direct);
+    if (portNumber) CFRelease(portNumber);
+    if (peer) CFRelease(peer);
+    if (streamHost) CFRelease(streamHost);
+    return result;
 }
 
 static void openConnection(struct _CFURLConnection * connection) {
@@ -611,6 +650,18 @@ static void readStreamEvent(CFReadStreamRef stream, CFStreamEventType type, void
                                 CFRelease(connection->message);
 
                                 setProxy(connection->replacementStream);
+                                if (connection->socketHostOverride &&
+                                    !setSocketHostOverride(connection->replacementStream, connection->request,
+                                        connection->socketHostOverride, connection->socketPortOverride)) {
+                                    CFRelease(connection->replacementStream);
+                                    connection->replacementStream = NULL;
+                                    CFErrorRef error = CFErrorCreate(kCFAllocatorDefault, ErrorDomain,
+                                        kCFURLErrorCannotConnectToHost, NULL);
+                                    connectionFailed(connection, error);
+                                    CFRelease(error);
+                                    broadcastConnectionState(connection, true);
+                                    return;
+                                }
 
                                 CFStreamClientContext clientContext = {
                                     .version = 0,
@@ -727,6 +778,9 @@ CFURLConnectionRef CFURLConnectionCreate(CFAllocatorRef allocator, CFURLRequestR
 
     connection->finished = false;
     connection->cancelled = 0;
+    connection->socketHostOverride = NULL;
+    connection->socketPortOverride = 0;
+    connection->started = false;
 
     connection->request = (CFURLRequestRef)CFRetain(request);
 
@@ -1141,8 +1195,30 @@ static void *CFURLConnectionManager(void *ctx) {
     return NULL;
 }
 
+Boolean _CFURLConnectionSetSocketHostOverride(CFURLConnectionRef conn, CFHostRef host, SInt32 port) {
+    struct _CFURLConnection *connection = (struct _CFURLConnection *)conn;
+    if (!host || port <= 0 || port > 65535)
+        return false;
+    pthread_mutex_lock(&connection->modeLock);
+    Boolean result = !connection->started && !OSAtomicAdd32Barrier(0, &connection->cancelled) &&
+        !connection->socketHostOverride &&
+        setSocketHostOverride(connection->stream, connection->request, host, port);
+    if (result) {
+        connection->socketHostOverride = (CFHostRef)CFRetain(host);
+        connection->socketPortOverride = port;
+    }
+    pthread_mutex_unlock(&connection->modeLock);
+    return result;
+}
+
 void CFURLConnectionStart(CFURLConnectionRef conn) {
-    enqueueConnection(conn);
+    struct _CFURLConnection *connection = (struct _CFURLConnection *)conn;
+    pthread_mutex_lock(&connection->modeLock);
+    Boolean start = !connection->started;
+    connection->started = true;
+    pthread_mutex_unlock(&connection->modeLock);
+    if (start)
+        enqueueConnection(conn);
 }
 
 void CFURLConnectionCancel(CFURLConnectionRef conn) {

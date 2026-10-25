@@ -1553,6 +1553,22 @@ _SocketStreamSetProperty(CFTypeRef stream, CFStringRef propertyName, CFTypeRef p
     else if (CFEqual(propertyName, kCFStreamPropertySOCKSProxy))
 		result = _SOCKSSetInfo_NoLock(ctxt, (CFDictionaryRef)propertyValue);
 	
+	else if ((CFEqual(propertyName, kCFStreamPropertySocketRemoteHost) ||
+			  CFEqual(propertyName, _kCFStreamPropertySocketRemotePort)) &&
+			 !__CFBitIsSet(ctxt->_flags, kFlagBitOpenStarted) &&
+			 !__CFBitIsSet(ctxt->_flags, kFlagBitOpenComplete))
+	{
+		/* Creation-time destination override; the TLS peer is independent. */
+		if (propertyValue &&
+			((CFEqual(propertyName, kCFStreamPropertySocketRemoteHost) &&
+			  CFGetTypeID(propertyValue) == CFHostGetTypeID()) ||
+			 (CFEqual(propertyName, _kCFStreamPropertySocketRemotePort) &&
+			  CFGetTypeID(propertyValue) == CFNumberGetTypeID()))) {
+			CFDictionarySetValue(ctxt->_properties, propertyName, propertyValue);
+			result = TRUE;
+		}
+	}
+
 	else if (CFEqual(propertyName, _kCFStreamPropertyHostForOpen) ||
 			 CFEqual(propertyName, _kCFStreamPropertyReadTimeout) ||
 			 CFEqual(propertyName, _kCFStreamPropertyWriteTimeout) ||

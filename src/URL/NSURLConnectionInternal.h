@@ -3,6 +3,10 @@
 #import "NSURLProtocolInternal.h"
 #import <CFNetwork/CFURLConnection.h>
 
+@interface NSURLConnection (NSCFSocketHostOverride)
+- (BOOL)_setSocketHostOverride:(CFHostRef)host port:(SInt32)port;
+@end
+
 @class NSMutableDictionary;
 @class NSMutableArray;
 
@@ -57,5 +61,6 @@ CF_PRIVATE
 - (NSDictionary *)_connectionProperties;
 - (void)dealloc;
 - (id)initWithInfo:(const struct InternalInit *)info;
+- (BOOL)_setSocketHostOverride:(CFHostRef)host port:(SInt32)port;
 
 @end

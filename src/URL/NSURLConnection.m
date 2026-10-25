@@ -487,6 +487,11 @@ static CFCachedURLResponseRef cache(const void *info, CFCachedURLResponseRef cac
     return _connectionProperties;
 }
 
+- (BOOL)_setSocketHostOverride:(CFHostRef)host port:(SInt32)port
+{
+    return !_protocol && _CFURLConnectionSetSocketHostOverride(_cfurlconnection, host, port);
+}
+
 - (void)start
 {
     if (!_connectionActive && _connection) {
@@ -598,6 +603,11 @@ static CFCachedURLResponseRef cache(const void *info, CFCachedURLResponseRef cac
 - (void)unscheduleFromRunLoop:(NSRunLoop *)aRunLoop forMode:(NSString *)mode
 {
     [_internal unscheduleFromRunLoop:aRunLoop forMode:mode];
+}
+
+- (BOOL)_setSocketHostOverride:(CFHostRef)host port:(SInt32)port
+{
+    return [_internal _setSocketHostOverride:host port:port];
 }
 
 - (void)setDelegateQueue:(NSOperationQueue*)queue

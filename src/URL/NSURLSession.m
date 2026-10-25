@@ -14,6 +14,11 @@
 #import <Foundation/NSURL.h>
 #import <Foundation/NSURLResponse.h>
 #import <Foundation/NSString.h>
+#import <Foundation/NSException.h>
+#import <CFNetwork/CFNSURLConnection.h>
+#import "NSURLConnectionInternal.h"
+#include <dlfcn.h>
+#include <netinet/in.h>
 
 const int64_t NSURLSessionTransferSizeUnknown = -1LL;
 NSString* const NSURLSessionDownloadTaskResumeData = @"NSURLSessionDownloadTaskResumeData";
@@ -75,7 +80,7 @@ NSString* const NSURLSessionDownloadTaskResumeData = @"NSURLSessionDownloadTaskR
  * the connection and does not deliver a cancellation callback.
  *
  * Only data tasks are provided here. This does not implement download/upload
- * tasks, private HTTPUtilities policies, host overrides, or Network activities.
+ * tasks, other private HTTPUtilities policies, or Network activities.
  */
 @interface __NSCFURLSessionDataTask : NSURLSessionDataTask <NSURLConnectionDataDelegate> {
     __NSCFURLSession *_session;
@@ -87,6 +92,8 @@ NSString* const NSURLSessionDownloadTaskResumeData = @"NSURLSessionDownloadTaskR
     NSUInteger _identifier;
     NSURLSessionTaskState _state;
     NSUInteger _suspendCount;
+    BOOL _hasResumed;
+    NSObject<OS_nw_endpoint> *_hostOverride;
     BOOL _workerScheduled;
     NSURLConnection *_connection;
     BOOL _connectionScheduled;
@@ -104,6 +111,7 @@ NSString* const NSURLSessionDownloadTaskResumeData = @"NSURLSessionDownloadTaskR
 - (void)_signalWorker;
 - (void)_updateConnection;
 - (void)_finishWithError:(NSError *)error;
+- (NSError *)_applyHostOverride;
 @end
 
 
@@ -147,6 +155,7 @@ NSURLSessionDataTask *_NSCFURLSessionCreateDataTask(__NSCFURLSession *session,
     [_data release];
     [_completion release];
     [_loadingError release];
+    [_hostOverride release];
     [super dealloc];
 }
 
@@ -176,6 +185,84 @@ NSURLSessionDataTask *_NSCFURLSessionCreateDataTask(__NSCFURLSession *session,
     }
 }
 
+- (NSObject<OS_nw_endpoint> *)_hostOverride
+{
+    @synchronized (self) {
+        return [[_hostOverride retain] autorelease];
+    }
+}
+
+- (void)set_hostOverride:(NSObject<OS_nw_endpoint> *)endpoint
+{
+    @synchronized (self) {
+        if (_hasResumed || _state == NSURLSessionTaskStateCanceling || _state == NSURLSessionTaskStateCompleted)
+            [NSException raise:NSInternalInconsistencyException
+                format:@"The task host override cannot change after its first resume or cancellation"];
+        [endpoint retain];
+        [_hostOverride release];
+        _hostOverride = endpoint;
+    }
+}
+
+/* No load-time Network dependency: libnetwork itself needs Foundation, whose
+ * first-pass CFNetwork provider must remain independently linkable. Resolve
+ * only the genuine, typed public endpoint accessors from an already-loaded
+ * provider. Absence is an error, never an ignored successful override.
+ */
+- (NSError *)_applyHostOverride
+{
+    if (!_hostOverride)
+        return nil;
+    typedef const struct sockaddr *(*GetAddress)(NSObject<OS_nw_endpoint> *);
+    typedef const char *(*GetHostname)(NSObject<OS_nw_endpoint> *);
+    typedef uint16_t (*GetPort)(NSObject<OS_nw_endpoint> *);
+    static GetAddress getAddress;
+    static GetHostname getHostname;
+    static GetPort getPort;
+    static dispatch_once_t providerOnce;
+    dispatch_once(&providerOnce, ^{
+        getAddress = (GetAddress)dlsym(RTLD_DEFAULT, "nw_endpoint_get_address");
+        getHostname = (GetHostname)dlsym(RTLD_DEFAULT, "nw_endpoint_get_hostname");
+        getPort = (GetPort)dlsym(RTLD_DEFAULT, "nw_endpoint_get_port");
+    });
+    if (!getAddress || !getHostname || !getPort)
+        return [NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorUnsupportedURL
+            userInfo:@{NSLocalizedDescriptionKey: @"The Network endpoint provider is unavailable"}];
+
+    CFHostRef host = NULL;
+    const struct sockaddr *address = getAddress(_hostOverride);
+    uint16_t port = getPort(_hostOverride); /* Network API returns host byte order. */
+    if (address) {
+        size_t length = address->sa_family == AF_INET ? sizeof(struct sockaddr_in) :
+            address->sa_family == AF_INET6 ? sizeof(struct sockaddr_in6) : 0;
+        if (length && address->sa_len == length) {
+            CFDataRef data = CFDataCreate(kCFAllocatorDefault, (const UInt8 *)address, length);
+            if (data) {
+                host = CFHostCreateWithAddress(kCFAllocatorDefault, data);
+                CFRelease(data);
+            }
+        }
+    } else {
+        const char *hostname = getHostname(_hostOverride);
+        if (hostname && hostname[0]) {
+            CFStringRef name = CFStringCreateWithCString(kCFAllocatorDefault, hostname, kCFStringEncodingUTF8);
+            if (name) {
+                host = CFHostCreateWithName(kCFAllocatorDefault, name);
+                CFRelease(name);
+            }
+        }
+    }
+    if (!host || !port) {
+        if (host) CFRelease(host);
+        return [NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorBadURL
+            userInfo:@{NSLocalizedDescriptionKey: @"The host override must supply an IP address or hostname and a nonzero port"}];
+    }
+    BOOL applied = [_connection _setSocketHostOverride:host port:port];
+    CFRelease(host);
+    return applied ? nil : [NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorCannotConnectToHost
+        userInfo:@{NSLocalizedDescriptionKey: @"The connection cannot apply the host override"}];
+}
+
 /* Called with the task lock held; the session publishes its worker atomically. */
 - (void)_signalWorker
 {
@@ -188,6 +275,7 @@ NSURLSessionDataTask *_NSCFURLSessionCreateDataTask(__NSCFURLSession *session,
     @synchronized (self) {
         if (_state == NSURLSessionTaskStateCanceling || _state == NSURLSessionTaskStateCompleted)
             return;
+        _hasResumed = YES;
         if (_suspendCount)
             --_suspendCount;
         if (!_suspendCount) {
@@ -245,6 +333,15 @@ NSURLSessionDataTask *_NSCFURLSessionCreateDataTask(__NSCFURLSession *session,
                 return;
             }
             _connection = [[NSURLConnection alloc] initWithRequest:_currentRequest delegate:self startImmediately:NO];
+            NSError *overrideError = [self _applyHostOverride];
+            if (overrideError) {
+                /* Nothing was started or scheduled: dispose without cancelling
+                 * through a connection manager that may not exist yet. */
+                [_connection release];
+                _connection = nil;
+                [self _finishWithError:overrideError];
+                return;
+            }
             [_connection scheduleInRunLoop:[NSRunLoop currentRunLoop] forMode:NSDefaultRunLoopMode];
             _connectionScheduled = YES;
             [_connection start];

@@ -276,6 +276,12 @@ static CFStreamError httpConnectionCreateStreams(CFAllocatorRef allocator, const
 		CFRelease(callback);
 	}
 
+    /* Set the original URL peer before creating the SecureTransport context. */
+    if (connInfo->streamProperties) {
+        CFStringRef peer = CFDictionaryGetValue(connInfo->streamProperties, _kCFStreamPropertySocketPeerName);
+        if (peer)
+            CFReadStreamSetProperty(rStream, _kCFStreamPropertySocketPeerName, peer);
+    }
     if (connInfo->type == kHTTPS) {
         CFReadStreamSetProperty(rStream, kCFStreamPropertySocketSecurityLevel, kCFStreamSocketSecurityLevelNegotiatedSSL);
     }
