@@ -36,6 +36,8 @@ struct __CFHTTPCookie {
 static void __CFHTTPCookieDeallocate(CFTypeRef cf) {
     struct __CFHTTPCookie *item = (struct __CFHTTPCookie *)cf;
     CFRelease(item->_properties);
+    if (item->_domain)
+        CFRelease(item->_domain);
 }
 
 static CFTypeID __kCFHTTPCookieTypeID = _kCFRuntimeNotATypeID;
@@ -70,7 +72,7 @@ CFHTTPCookieRef _CFHTTPCookieCreate(CFAllocatorRef allocator) {
 
 CFHTTPCookieRef CFHTTPCookieCreateWithProperties(CFDictionaryRef properties) {
     CFHTTPCookieRef cookie = _CFHTTPCookieCreate(kCFAllocatorDefault);
-    cookie->_properties = CFRetain(CFDictionaryCreateCopy(kCFAllocatorDefault, properties));
+    cookie->_properties = CFDictionaryCreateCopy(kCFAllocatorDefault, properties);
     if (CFHTTPCookieGetDomain(cookie)==NULL||CFHTTPCookieGetPath(cookie)==NULL) {
         CFRelease(cookie);
         cookie = NULL;
@@ -88,7 +90,9 @@ CFStringRef CFHTTPCookieGetName(CFHTTPCookieRef cookie) {
 
 CFStringRef CFHTTPCookieGetDomain(CFHTTPCookieRef cookie) {
     if (cookie->_domain == NULL) {
-        cookie->_domain = CFStringCreateCopy(kCFAllocatorDefault, CFDictionaryGetValue(cookie->_properties, kCFHTTPCookieDomain));
+        CFStringRef domain = CFDictionaryGetValue(cookie->_properties, kCFHTTPCookieDomain);
+        if (domain)
+            cookie->_domain = CFStringCreateCopy(kCFAllocatorDefault, domain);
         
         if (cookie->_domain == NULL) {
             CFTypeRef urlString = CFDictionaryGetValue(cookie->_properties, kCFHTTPCookieOriginURL);
