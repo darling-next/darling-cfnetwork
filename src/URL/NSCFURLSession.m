@@ -177,7 +177,7 @@ static void sessionWorkerCommand(void *info)
             [self release];
             return nil;
         }
-        _nsCFConfig = [configuration retain];
+        _nsCFConfig = [configuration copy];
         _delegateQueue = queue ? [queue retain] : [[NSOperationQueue alloc] init];
         if (!queue)
             [_delegateQueue setMaxConcurrentOperationCount:1];
@@ -194,7 +194,7 @@ static void sessionWorkerCommand(void *info)
 
 - (NSURLSessionConfiguration *)configuration
 {
-    return _nsCFConfig;
+    return [[_nsCFConfig copy] autorelease];
 }
 
 - (void)dealloc

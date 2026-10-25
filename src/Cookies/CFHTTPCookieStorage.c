@@ -19,7 +19,8 @@ struct __CFHTTPCookieStorage {
 
 static void __CFHTTPCookieStorageDeallocate(CFTypeRef cf) {
     struct __CFHTTPCookieStorage *item = (struct __CFHTTPCookieStorage *)cf;
-    CFRelease(item->_cookies);
+    if (item->_cookies)
+        CFRelease(item->_cookies);
 }
 
 static CFTypeID __kCFHTTPCookieStorageTypeID = _kCFRuntimeNotATypeID;
@@ -47,11 +48,17 @@ CFTypeID CFHTTPCookieStorageGetTypeID(void) {
     return __kCFHTTPCookieStorageTypeID;
 }
 
-static struct __CFHTTPCookieStorage *_CFHTTPCookieStorageCreate(CFAllocatorRef allocator) {
+CFHTTPCookieStorageRef _CFHTTPCookieStorageCreate(CFAllocatorRef allocator) {
     CFIndex size = sizeof(struct __CFHTTPCookieStorage) - sizeof(CFRuntimeBase);
     struct __CFHTTPCookieStorage *cookieStorage = (struct __CFHTTPCookieStorage *)_CFRuntimeCreateInstance(allocator, CFHTTPCookieStorageGetTypeID(), size, NULL);
+    if (!cookieStorage)
+        return NULL;
     
-    cookieStorage->_cookies = (CFMutableArrayRef)CFRetain(CFArrayCreateMutable(allocator, 0, &kCFTypeArrayCallBacks));
+    cookieStorage->_cookies = CFArrayCreateMutable(allocator, 0, &kCFTypeArrayCallBacks);
+    if (!cookieStorage->_cookies) {
+        CFRelease(cookieStorage);
+        return NULL;
+    }
     
     
     return cookieStorage;

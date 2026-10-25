@@ -7,6 +7,8 @@
 #include "CFURLResponse.h"
 #include "CFCachedURLResponse.h"
 #include <CFNetwork/CFHost.h>
+#include "CFURLCache.h"
+#include "CFHTTPCookieStorage.h"
 
 #if PRAGMA_ONCE
 #pragma once
@@ -67,6 +69,13 @@ void CFURLConnectionCancel(CFURLConnectionRef connection);
  * Connect directly to host:port, retaining the request URL's HTTP/TLS identity.
  */
 Boolean _CFURLConnectionSetSocketHostOverride(CFURLConnectionRef connection, CFHostRef host, SInt32 port);
+
+/* Explicit session policy; NULL cache disables both lookup and storage.
+ * Cookie storage, when non-NULL, is retained for both lookup and response storage.
+ */
+Boolean _CFURLConnectionSetSessionPolicy(CFURLConnectionRef connection,
+    CFURLCacheRef cache, CFHTTPCookieStorageRef cookies, Boolean allowsReachability,
+    Boolean suppressAutoUserAgent);
 
 __END_DECLS
 

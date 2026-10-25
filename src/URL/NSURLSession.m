@@ -16,12 +16,22 @@
 #import <Foundation/NSString.h>
 #import <Foundation/NSException.h>
 #import <CFNetwork/CFNSURLConnection.h>
+#import "NSURLCacheInternal.h"
+#import <Foundation/NSURLCredentialStorage.h>
+#import <Foundation/NSSet.h>
+#import <Foundation/NSDictionary.h>
+#import <Foundation/NSArray.h>
+#import <CFNetwork/CFHTTPCookieStorage.h>
 #import "NSURLConnectionInternal.h"
 #include <dlfcn.h>
 #include <netinet/in.h>
 
 const int64_t NSURLSessionTransferSizeUnknown = -1LL;
 NSString* const NSURLSessionDownloadTaskResumeData = @"NSURLSessionDownloadTaskResumeData";
+
+@interface NSHTTPCookieStorage (NSCFSessionStorage)
+- (id)initWithStorage:(CFHTTPCookieStorageRef)storage;
+@end
 
 @implementation NSURLSession
 // The concrete class cluster owns storage and implements these accessors.
@@ -333,6 +343,14 @@ NSURLSessionDataTask *_NSCFURLSessionCreateDataTask(__NSCFURLSession *session,
                 return;
             }
             _connection = [[NSURLConnection alloc] initWithRequest:_currentRequest delegate:self startImmediately:NO];
+            if (![_connection _setSessionConfiguration:[_session configuration]]) {
+                [_connection release];
+                _connection = nil;
+                [self _finishWithError:[NSError errorWithDomain:NSURLErrorDomain
+                    code:NSURLErrorUnsupportedURL userInfo:
+                        @{NSLocalizedDescriptionKey: @"The session configuration requires an unavailable transport provider"}]];
+                return;
+            }
             NSError *overrideError = [self _applyHostOverride];
             if (overrideError) {
                 /* Nothing was started or scheduled: dispose without cancelling
@@ -488,14 +506,131 @@ NSURLSessionDataTask *_NSCFURLSessionCreateDataTask(__NSCFURLSession *session,
 
 @implementation NSURLSessionConfiguration
 
-static NSURLSessionConfiguration *_defaultSessionConfiguration = nil;
-
-+ (NSURLSessionConfiguration *)defaultSessionConfiguration {
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        _defaultSessionConfiguration = [[NSURLSessionConfiguration alloc] init];
-    });
-    return _defaultSessionConfiguration;
+/* The vendored Swift configuration and its newer sibling both create fresh
+ * values and copy settings into a session. They use a different Swift/curl
+ * transport and cannot be imported into this ObjC/CFURLConnection provider.
+ * darling-cfnetwork upstream still has only the mutable default singleton.
+ */
++ (NSURLSessionConfiguration *)defaultSessionConfiguration
+{
+    return [[[self alloc] init] autorelease];
 }
+
++ (NSURLSessionConfiguration *)ephemeralSessionConfiguration
+{
+    NSURLSessionConfiguration *configuration = [[[self alloc] _initWithoutStorage] autorelease];
+    CFHTTPCookieStorageRef cookies = _CFHTTPCookieStorageCreate(kCFAllocatorDefault);
+    if (!cookies)
+        return nil;
+    configuration.HTTPCookieStorage = [[[NSHTTPCookieStorage alloc] initWithStorage:cookies] autorelease];
+    CFRelease(cookies);
+    configuration.URLCredentialStorage = nil;
+    /* NSURLCache's public nil diskPath selects CACHEDIR when it is set.
+     * Construct the real CF provider without a path so ephemeral creation
+     * cannot enumerate or trim another session's persistent entries.
+     */
+    CFURLCacheRef cache = CFURLCacheCreate(kCFAllocatorDefault, 4 * 1024 * 1024, 0, NULL);
+    if (!cache)
+        return nil;
+    configuration.URLCache = [[[NSURLCache alloc] _initWithExistingSharedCFURLCache:cache] autorelease];
+    CFRelease(cache);
+    return configuration;
+}
+
+- (id)init
+{
+    if ((self = [self _initWithoutStorage])) {
+        _HTTPCookieStorage = [[NSHTTPCookieStorage sharedHTTPCookieStorage] retain];
+        _URLCache = [[NSURLCache sharedURLCache] retain];
+    }
+    return self;
+}
+
+- (id)_initWithoutStorage
+{
+    if ((self = [super init])) {
+        _requestCachePolicy = NSURLRequestUseProtocolCachePolicy;
+        _timeoutIntervalForRequest = 60;
+        _timeoutIntervalForResource = 604800;
+        _allowsCellularAccess = YES;
+        _HTTPShouldSetCookies = YES;
+        _HTTPCookieAcceptPolicy = NSHTTPCookieAcceptPolicyOnlyFromMainDocumentDomain;
+        _HTTPMaximumConnectionsPerHost = 6;
+        /* NSURLCredentialStorage has no implementation, including its shared
+         * factory. Do not invent a shared provider or an authentication policy.
+         */
+        __allowsReachabilityCheck = YES;
+    }
+    return self;
+}
+
+- (id)copyWithZone:(NSZone *)zone
+{
+    NSURLSessionConfiguration *copy = [[[self class] allocWithZone:zone] _initWithoutStorage];
+    copy.requestCachePolicy = self.requestCachePolicy;
+    copy.timeoutIntervalForRequest = self.timeoutIntervalForRequest;
+    copy.timeoutIntervalForResource = self.timeoutIntervalForResource;
+    copy.networkServiceType = self.networkServiceType;
+    copy.allowsCellularAccess = self.allowsCellularAccess;
+    copy.discretionary = self.discretionary;
+    copy.sessionSendsLaunchEvents = self.sessionSendsLaunchEvents;
+    copy.connectionProxyDictionary = self.connectionProxyDictionary;
+    copy.TLSMinimumSupportedProtocol = self.TLSMinimumSupportedProtocol;
+    copy.TLSMaximumSupportedProtocol = self.TLSMaximumSupportedProtocol;
+    copy.HTTPShouldUsePipelining = self.HTTPShouldUsePipelining;
+    copy.HTTPShouldSetCookies = self.HTTPShouldSetCookies;
+    copy.HTTPCookieAcceptPolicy = self.HTTPCookieAcceptPolicy;
+    copy.HTTPAdditionalHeaders = self.HTTPAdditionalHeaders;
+    copy.HTTPMaximumConnectionsPerHost = self.HTTPMaximumConnectionsPerHost;
+    copy.HTTPCookieStorage = self.HTTPCookieStorage;
+    copy.URLCredentialStorage = self.URLCredentialStorage;
+    copy.URLCache = self.URLCache;
+    copy.protocolClasses = self.protocolClasses;
+    copy._allowsReachabilityCheck = self._allowsReachabilityCheck;
+    copy._suppressedAutoAddedHTTPHeaders = self._suppressedAutoAddedHTTPHeaders;
+    return copy;
+}
+
+- (void)dealloc
+{
+    [_identifier release];
+    [_connectionProxyDictionary release];
+    [_HTTPAdditionalHeaders release];
+    [_HTTPCookieStorage release];
+    [_URLCredentialStorage release];
+    [_URLCache release];
+    [_protocolClasses release];
+    [__suppressedAutoAddedHTTPHeaders release];
+    [super dealloc];
+}
+
+- (void)set_suppressedAutoAddedHTTPHeaders:(NSSet *)headers
+{
+    for (NSString *header in headers) {
+        if (![header isKindOfClass:[NSString class]] ||
+            [header caseInsensitiveCompare:@"User-Agent"] != NSOrderedSame)
+            [NSException raise:NSInvalidArgumentException
+                format:@"Automatic suppression of %@ is not supported by this HTTP provider", header];
+    }
+    NSSet *copy = [headers copy];
+    [__suppressedAutoAddedHTTPHeaders release];
+    __suppressedAutoAddedHTTPHeaders = copy;
+}
+
+@synthesize identifier = _identifier, requestCachePolicy = _requestCachePolicy;
+@synthesize timeoutIntervalForRequest = _timeoutIntervalForRequest;
+@synthesize timeoutIntervalForResource = _timeoutIntervalForResource;
+@synthesize networkServiceType = _networkServiceType, allowsCellularAccess = _allowsCellularAccess;
+@synthesize discretionary = _discretionary, sessionSendsLaunchEvents = _sessionSendsLaunchEvents;
+@synthesize connectionProxyDictionary = _connectionProxyDictionary;
+@synthesize TLSMinimumSupportedProtocol = _TLSMinimumSupportedProtocol;
+@synthesize TLSMaximumSupportedProtocol = _TLSMaximumSupportedProtocol;
+@synthesize HTTPShouldUsePipelining = _HTTPShouldUsePipelining, HTTPShouldSetCookies = _HTTPShouldSetCookies;
+@synthesize HTTPCookieAcceptPolicy = _HTTPCookieAcceptPolicy, HTTPAdditionalHeaders = _HTTPAdditionalHeaders;
+@synthesize HTTPMaximumConnectionsPerHost = _HTTPMaximumConnectionsPerHost;
+@synthesize HTTPCookieStorage = _HTTPCookieStorage, URLCredentialStorage = _URLCredentialStorage;
+@synthesize URLCache = _URLCache, protocolClasses = _protocolClasses;
+@synthesize _allowsReachabilityCheck = __allowsReachabilityCheck;
+@synthesize _suppressedAutoAddedHTTPHeaders = __suppressedAutoAddedHTTPHeaders;
 
 @end

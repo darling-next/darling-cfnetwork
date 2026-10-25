@@ -38,6 +38,18 @@
     return self;
 }
 
+- (CFHTTPCookieStorageRef)_CFHTTPCookieStorage
+{
+    return _storage;
+}
+
+- (void)dealloc
+{
+    if (_storage)
+        CFRelease(_storage);
+    [super dealloc];
+}
+
 
 
 - (NSArray *)cookies

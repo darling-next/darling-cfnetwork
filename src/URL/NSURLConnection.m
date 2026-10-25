@@ -18,6 +18,8 @@
 #import <Foundation/NSStream.h>
 #import <Foundation/NSOperation.h>
 #import <Foundation/NSURLProtocol.h>
+#import <Foundation/NSURLSession.h>
+#import <Foundation/NSSet.h>
 #import "NSURLAuthenticationChallengeInternal.h"
 #import "NSURLConnectionInternal.h"
 #import "NSURLProtectionSpaceInternal.h"
@@ -29,6 +31,10 @@
 #import <CFNetwork/CFURLConnection.h>
 #import <CoreFoundation/CFData.h>
 #import <Foundation/NSURLError.h>
+
+@interface NSHTTPCookieStorage (NSCFSessionStorage)
+- (CFHTTPCookieStorageRef)_CFHTTPCookieStorage;
+@end
 
 @implementation NSURLConnectionInternal
 
@@ -492,6 +498,35 @@ static CFCachedURLResponseRef cache(const void *info, CFCachedURLResponseRef cac
     return !_protocol && _CFURLConnectionSetSocketHostOverride(_cfurlconnection, host, port);
 }
 
+- (BOOL)_setSessionConfiguration:(NSURLSessionConfiguration *)configuration
+{
+    if (_protocol || [configuration URLCredentialStorage])
+        return NO;
+    NSURLCache *cache = [configuration URLCache];
+    NSHTTPCookieStorage *cookies = [configuration HTTPCookieStorage];
+    /* These concrete wrappers own real CF providers. A subclass may implement
+     * entirely different storage, which this C transport cannot call.
+     */
+    if ((cache && [cache class] != [NSURLCache class]) ||
+        (cookies && [cookies class] != [NSHTTPCookieStorage class]))
+        return NO;
+    CFURLCacheRef cfCache = cache ? [cache _CFURLCache] : NULL;
+    CFHTTPCookieStorageRef cfCookies = cookies ? [cookies _CFHTTPCookieStorage] : NULL;
+    if ((cache && !cfCache) || (cookies && !cfCookies))
+        return NO;
+    if (![configuration HTTPShouldSetCookies])
+        cfCookies = NULL;
+    BOOL suppressUserAgent = NO;
+    for (NSString *header in [configuration _suppressedAutoAddedHTTPHeaders]) {
+        if ([header caseInsensitiveCompare:@"User-Agent"] == NSOrderedSame)
+            suppressUserAgent = YES;
+        else
+            return NO;
+    }
+    return _CFURLConnectionSetSessionPolicy(_cfurlconnection, cfCache, cfCookies,
+        [configuration _allowsReachabilityCheck], suppressUserAgent);
+}
+
 - (void)start
 {
     if (!_connectionActive && _connection) {
@@ -608,6 +643,11 @@ static CFCachedURLResponseRef cache(const void *info, CFCachedURLResponseRef cac
 - (BOOL)_setSocketHostOverride:(CFHostRef)host port:(SInt32)port
 {
     return [_internal _setSocketHostOverride:host port:port];
+}
+
+- (BOOL)_setSessionConfiguration:(NSURLSessionConfiguration *)configuration
+{
+    return [_internal _setSessionConfiguration:configuration];
 }
 
 - (void)setDelegateQueue:(NSOperationQueue*)queue

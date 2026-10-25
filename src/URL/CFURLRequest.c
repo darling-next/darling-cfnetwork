@@ -639,13 +639,10 @@ CFHTTPMessageRef CFHTTPMessageCreateRequestFromURLRequest(CFAllocatorRef allocat
         CFRelease(connection);
     }
 
-    CFStringRef user_agent = CFHTTPMessageCopyHeaderFieldValue(message, CFSTR("User-Agent"));
-    if (user_agent == NULL) {
-        CFStringRef agent = CFURLRequestDefaultUserAgent();
-        CFHTTPMessageSetHeaderFieldValue(message, CFSTR("User-Agent"), agent);
-    } else {
-        CFRelease(user_agent);
-    }
+    /* CFHTTPStream adds its automatic User-Agent at transmission, after the
+     * connection's policy is known. Preserve explicit request headers here
+     * rather than making a generated value indistinguishable from one.
+     */
 
     CFStringRef accept_language = CFHTTPMessageCopyHeaderFieldValue(message, CFSTR("Accept-Language"));
     if (accept_language == NULL) {

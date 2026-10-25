@@ -13,6 +13,7 @@ typedef struct __CFHTTPCookieStorage *CFHTTPCookieStorageRef;
 
 
 CFHTTPCookieStorageRef CFHTTPCookieStorageGetDefault();
+CFHTTPCookieStorageRef _CFHTTPCookieStorageCreate(CFAllocatorRef allocator);
 void CFHTTPCookieStorageDeleteCookie(CFHTTPCookieStorageRef storage, CFHTTPCookieRef cookie);
 void CFHTTPCookieStorageSetCookie(CFHTTPCookieStorageRef storage, CFHTTPCookieRef cookie);
 void CFHTTPCookieStorageSetCookies(CFHTTPCookieStorageRef storage, CFArrayRef cookies);

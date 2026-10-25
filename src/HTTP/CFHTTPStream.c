@@ -768,7 +768,7 @@ extern CFStringRef _CFNetworkUserAgentString(void) {
     return userAgentString;
 }
 
-extern void cleanUpRequest(CFHTTPMessageRef req, int length, Boolean forPersistentConnection, Boolean forProxy) {
+static void cleanUpRequestWithPolicy(CFHTTPMessageRef req, int length, Boolean forPersistentConnection, Boolean forProxy, Boolean suppressAutoUserAgent) {
     // Perform basic house-keeping on the request: make sure a valid user-agent is set, make sure the Host: parameter is set, and make sure the Content-Length is set if there is data.
     CFURLRef dest;
     CFStringRef host;
@@ -776,7 +776,8 @@ extern void cleanUpRequest(CFHTTPMessageRef req, int length, Boolean forPersiste
     val = CFHTTPMessageCopyHeaderFieldValue(req, _kCFHTTPStreamUserAgentHeader);
     if (val == NULL) {
         // Some servers require that the User-Agent be listed first.
-        _CFHTTPMessageSetHeader(req, _kCFHTTPStreamUserAgentHeader, _CFNetworkUserAgentString(), 0);
+        if (!suppressAutoUserAgent)
+            _CFHTTPMessageSetHeader(req, _kCFHTTPStreamUserAgentHeader, _CFNetworkUserAgentString(), 0);
     } else {
         CFRelease(val);
     }
@@ -819,6 +820,10 @@ extern void cleanUpRequest(CFHTTPMessageRef req, int length, Boolean forPersiste
     if (dest) CFRelease(dest);
 }
 
+extern void cleanUpRequest(CFHTTPMessageRef req, int length, Boolean forPersistentConnection, Boolean forProxy) {
+    cleanUpRequestWithPolicy(req, length, forPersistentConnection, forProxy, false);
+}
+
 static inline Boolean isConnectionToProxy(_CFNetConnectionRef conn) {
     _CFNetConnectionCacheKey key = (_CFNetConnectionCacheKey)_CFNetConnectionGetInfoPointer(conn);
     CFStringRef host;
@@ -837,6 +842,8 @@ static void prepareTransmission1(_CFHTTPRequest *req, CFWriteStreamRef requestSt
     CFStreamClientContext ctxt = {0, req, NULL, NULL, NULL};
     CFDataRef payload = NULL;
     Boolean forProxy = isConnectionToProxy(conn);
+    Boolean suppressAutoUserAgent = CFDictionaryGetValue(req->connProps,
+        CFSTR("_DarlingHTTPStreamSuppressAutoUserAgent")) == kCFBooleanTrue;
     
     
     // Set requestPayload properly; clean up the request
@@ -855,11 +862,11 @@ static void prepareTransmission1(_CFHTTPRequest *req, CFWriteStreamRef requestSt
             req->requestPayload = NULL;
             
         CFRelease(payload); // originalRequest is holding it for us
-        cleanUpRequest(req->currentRequest, length, reqIsPersistent, forProxy);
+        cleanUpRequestWithPolicy(req->currentRequest, length, reqIsPersistent, forProxy, suppressAutoUserAgent);
     } else if (!req->requestPayload) {
-        cleanUpRequest(req->currentRequest, 0, reqIsPersistent, forProxy);
+        cleanUpRequestWithPolicy(req->currentRequest, 0, reqIsPersistent, forProxy, suppressAutoUserAgent);
     } else {
-        cleanUpRequest(req->currentRequest, -1, reqIsPersistent, forProxy);
+        cleanUpRequestWithPolicy(req->currentRequest, -1, reqIsPersistent, forProxy, suppressAutoUserAgent);
     }
     
     // Set client on both streams and schedule.  Open payload (requestStream is already open)

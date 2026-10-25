@@ -29,6 +29,8 @@
 #define _kCFStreamPropertyHostForOpen CFSTR("_kCFStreamPropertyHostForOpen")
 #define _kCFStreamPropertySocketRemotePort CFSTR("_kCFStreamPropertySocketRemotePort")
 #define _kCFURLConnectionSocketRemoteHost CFSTR("kCFStreamPropertySocketRemoteHost")
+#define _kCFHTTPStreamSuppressAutoUserAgent CFSTR("_DarlingHTTPStreamSuppressAutoUserAgent")
+extern const CFStringRef kCFStreamPropertyAutoErrorOnSystemChange;
 
 #ifndef NDEBUG
 #define CACHE_LOG_ENABLED
@@ -156,6 +158,11 @@ struct _CFURLConnection {
     CFHostRef socketHostOverride;
     SInt32 socketPortOverride;
     Boolean started;
+    Boolean hasSessionPolicy;
+    CFHTTPCookieStorageRef sessionCookies;
+    Boolean allowsReachability;
+    Boolean suppressAutoUserAgent;
+    CFURLCacheRef sessionCache;
     CFURLResponseRef response;
     CFErrorRef error;
     ContentEncoding contentEncoding;
@@ -192,6 +199,10 @@ static void __CFURLConnectionDeallocate(CFTypeRef cf) {
     }
     if (connection->socketHostOverride)
         CFRelease(connection->socketHostOverride);
+    if (connection->sessionCache)
+        CFRelease(connection->sessionCache);
+    if (connection->sessionCookies)
+        CFRelease(connection->sessionCookies);
 
     if (connection->stream != NULL) {
         CFRelease(connection->stream);
@@ -357,6 +368,22 @@ static Boolean setSocketHostOverride(CFReadStreamRef stream, CFURLRequestRef req
     return result;
 }
 
+static Boolean setSessionStreamPolicy(struct _CFURLConnection *connection, CFReadStreamRef stream) {
+    if (!connection->hasSessionPolicy)
+        return true;
+    return CFReadStreamSetProperty(stream, kCFStreamPropertyAutoErrorOnSystemChange,
+               connection->allowsReachability ? kCFBooleanTrue : kCFBooleanFalse) &&
+        CFReadStreamSetProperty(stream, _kCFHTTPStreamSuppressAutoUserAgent,
+               connection->suppressAutoUserAgent ? kCFBooleanTrue : kCFBooleanFalse);
+}
+
+static Boolean copyConnectionCache(struct _CFURLConnection *connection, CFURLCacheRef *cache) {
+    if (!connection->hasSessionPolicy)
+        return CFURLCacheGetShared(cache);
+    *cache = connection->sessionCache ? (CFURLCacheRef)CFRetain(connection->sessionCache) : NULL;
+    return *cache != NULL;
+}
+
 static void openConnection(struct _CFURLConnection * connection) {
     /* Cancelled queued connections must never be resurrected by the manager. */
     if (OSAtomicAdd32Barrier(0, &connection->cancelled))
@@ -364,14 +391,19 @@ static void openConnection(struct _CFURLConnection * connection) {
     if (replayCached(connection)) {
         return;
     }
-    CFDictionaryRef cookiesHeaderFields = CFHTTPCookieStorageCopyRequestHeaderFieldsForURL(CFHTTPCookieStorageGetDefault(), CFURLRequestGetURL(connection->request));
+    CFHTTPCookieStorageRef cookies = connection->hasSessionPolicy
+        ? connection->sessionCookies : CFHTTPCookieStorageGetDefault();
+    CFDictionaryRef cookiesHeaderFields = cookies
+        ? CFHTTPCookieStorageCopyRequestHeaderFieldsForURL(cookies,
+            CFURLRequestGetURL(connection->request)) : NULL;
     if (cookiesHeaderFields != NULL) {
         CFMutableURLRequestRef alteredRequest = CFURLRequestCreateMutableCopy(kCFAllocatorDefault, connection->request);
         CFURLRequestAddValueForHTTPField(alteredRequest, CFSTR("Cookie"), CFDictionaryGetValue(cookiesHeaderFields, CFSTR("Cookie")));
         CFRelease(connection->request);
         connection->request = alteredRequest;
         CFHTTPMessageSetHeaderFieldValue(connection->message, CFSTR("Cookie"), CFDictionaryGetValue(cookiesHeaderFields, CFSTR("Cookie")));
-    };
+        CFRelease(cookiesHeaderFields);
+    }
 
     connection->streamValid = true;
     connection->valid = true;
@@ -549,7 +581,10 @@ static void readStreamEvent(CFReadStreamRef stream, CFStreamEventType type, void
         if (message != NULL && CFHTTPMessageIsHeaderComplete(message)) {
             CFURLRef finalUrl = CFReadStreamCopyProperty(stream, kCFStreamPropertyHTTPFinalURL);
             CFURLResponseRef response = CFURLResponseCreateWithCFHTTPMessage(kCFAllocatorDefault, finalUrl, message);
-            CFHTTPCookieStorageSetCookiesWithResponseHeaderFields(CFHTTPCookieStorageGetDefault(), CFURLResponseGetHeaderFields(response), finalUrl);
+            CFHTTPCookieStorageRef cookies = connection->hasSessionPolicy
+                ? connection->sessionCookies : CFHTTPCookieStorageGetDefault();
+            if (cookies)
+                CFHTTPCookieStorageSetCookiesWithResponseHeaderFields(cookies, CFURLResponseGetHeaderFields(response), finalUrl);
 
             UInt32 statusCode = CFHTTPMessageGetResponseStatusCode(message);
 
@@ -650,9 +685,10 @@ static void readStreamEvent(CFReadStreamRef stream, CFStreamEventType type, void
                                 CFRelease(connection->message);
 
                                 setProxy(connection->replacementStream);
-                                if (connection->socketHostOverride &&
-                                    !setSocketHostOverride(connection->replacementStream, connection->request,
-                                        connection->socketHostOverride, connection->socketPortOverride)) {
+                                if (!setSessionStreamPolicy(connection, connection->replacementStream) ||
+                                    (connection->socketHostOverride &&
+                                     !setSocketHostOverride(connection->replacementStream, connection->request,
+                                        connection->socketHostOverride, connection->socketPortOverride))) {
                                     CFRelease(connection->replacementStream);
                                     connection->replacementStream = NULL;
                                     CFErrorRef error = CFErrorCreate(kCFAllocatorDefault, ErrorDomain,
@@ -781,6 +817,9 @@ CFURLConnectionRef CFURLConnectionCreate(CFAllocatorRef allocator, CFURLRequestR
     connection->socketHostOverride = NULL;
     connection->socketPortOverride = 0;
     connection->started = false;
+    connection->hasSessionPolicy = false;
+    connection->sessionCache = NULL;
+    connection->sessionCookies = NULL;
 
     connection->request = (CFURLRequestRef)CFRetain(request);
 
@@ -851,6 +890,25 @@ CFURLConnectionRef CFURLConnectionCreate(CFAllocatorRef allocator, CFURLRequestR
     inflateInit2(connection->zStream, (MAX_WBITS + 32));
 
     return connection;
+}
+
+Boolean _CFURLConnectionSetSessionPolicy(CFURLConnectionRef conn, CFURLCacheRef cache,
+    CFHTTPCookieStorageRef cookies, Boolean allowsReachability, Boolean suppressAutoUserAgent) {
+    struct _CFURLConnection *connection = (struct _CFURLConnection *)conn;
+    if (!connection || connection->started || !connection->stream)
+        return false;
+    connection->hasSessionPolicy = true;
+    if (cookies) CFRetain(cookies);
+    if (connection->sessionCookies) CFRelease(connection->sessionCookies);
+    connection->sessionCookies = cookies;
+    connection->allowsReachability = allowsReachability;
+    connection->suppressAutoUserAgent = suppressAutoUserAgent;
+    if (!setSessionStreamPolicy(connection, connection->stream))
+        return false;
+    if (cache) CFRetain(cache);
+    if (connection->sessionCache) CFRelease(connection->sessionCache);
+    connection->sessionCache = cache;
+    return true;
 }
 
 void CFURLConnectionSetHandler(CFURLConnectionRef conn, const CFURLConnectionHandlerContext *handlerContext) {
@@ -1437,6 +1495,8 @@ static void startCaching(struct _CFURLConnection *connection) {
     if (connection->cachingState != kCachingStateNotCaching) {
         return;
     }
+    if (connection->hasSessionPolicy && !connection->sessionCache)
+        return;
 
     Boolean cacheable = _CFURLResponseIsCacheableWithRequest(connection->response, connection->request);
 #ifdef CACHE_LOG_ENABLED
@@ -1473,10 +1533,13 @@ static void cacheData(struct _CFURLConnection *connection, CFDataRef data) {
     size_t maxCachedDataSize = 0;
     {
         CFURLCacheRef cache = NULL;
-        if (CFURLCacheGetShared(&cache)) {
+        if (copyConnectionCache(connection, &cache)) {
             // In documentation for 'connection:willCacheResponse:' Apple specifies
             // that cache entry must not be larger than 5% of the disk cache size.
-            maxCachedDataSize = CFURLCacheDiskCapacity(cache) / 20;
+            size_t capacity = CFURLCacheDiskCapacity(cache);
+            if (!capacity)
+                capacity = CFURLCacheMemoryCapacity(cache);
+            maxCachedDataSize = capacity / 20;
             CFRelease(cache);
         }
     }
@@ -1536,7 +1599,9 @@ static void finishCaching(struct _CFURLConnection *connection) {
         connection->response,
         cachedData,
         NULL,
-        CFURLCacheStorageAllowed /* TODO: get this from request */);
+        connection->hasSessionPolicy && connection->sessionCache &&
+            !CFURLCacheDiskCapacity(connection->sessionCache)
+            ? CFURLCacheStorageAllowedInMemoryOnly : CFURLCacheStorageAllowed);
     CFRelease(cachedData);
 
     CFCachedURLResponseRef cachedResponse = connection->handler.cache ? // TODO: guard
@@ -1544,7 +1609,7 @@ static void finishCaching(struct _CFURLConnection *connection) {
         originalCachedResponse;
     if (cachedResponse) {
         CFURLCacheRef cache = NULL;
-        if (CFURLCacheGetShared(&cache)) {
+        if (copyConnectionCache(connection, &cache)) {
             CFURLCacheAddCachedResponseForRequest(cache, cachedResponse, connection->request);
             CFRelease(cache);
         }
@@ -1559,7 +1624,7 @@ static Boolean replayCached(struct _CFURLConnection *connection) {
     CFDataRef data = NULL;
     do {
         CFURLCacheRef cache = NULL;
-        if (CFURLCacheGetShared(&cache)) {
+        if (copyConnectionCache(connection, &cache)) {
             cachedResponse = CFURLCacheCopyResponseForRequest(cache, connection->request);
             CFRelease(cache);
         }
