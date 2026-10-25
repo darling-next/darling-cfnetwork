@@ -2,34 +2,31 @@
 #import <Foundation/NSURLSession.h>
 #import <dispatch/dispatch.h>
 
-@class NSOperationQueue, NSString, __NSCFSessionBridge;
+@class NSOperationQueue, NSOperation, NSString, NSMutableSet, __NSCFURLSessionWorker;
 
 __attribute__((visibility("hidden")))
-@interface __NSCFURLSessionConfiguration : NSObject
-@end
-
-__attribute__((visibility("hidden")))
-@interface __NSCFURLSession : NSObject {
-    __NSCFURLSessionConfiguration *_nsCFConfig;
+@interface __NSCFURLSession : NSURLSession {
+    NSURLSessionConfiguration *_nsCFConfig;
     BOOL _invalid;
+    BOOL _invalidationDelivered;
     NSOperationQueue *_delegateQueue;
     id <NSURLSessionDelegate> _delegate;
     NSString *_sessionDescription;
-    dispatch_queue_t _workQueue;
-    __NSCFSessionBridge *_connectionSession;
-    __NSCFURLSession *_extraRetain;
-    NSOperationQueue *_realDelegateQueue;
+    NSMutableSet *_tasks;
+    NSUInteger _nextTaskIdentifier;
+    NSOperation *_delegateTail;
+    NSUInteger _delegateGeneration;
+    __NSCFURLSessionWorker *_worker;
 }
 
-@property(retain) NSOperationQueue *realDelegateQueue; // @synthesize realDelegateQueue=_realDelegateQueue;
-@property(retain) __NSCFURLSession *extraRetain; // @synthesize extraRetain=_extraRetain;
-@property BOOL invalid; // @synthesize invalid=_invalid;
-@property(retain) __NSCFSessionBridge *connectionSession; // @synthesize connectionSession=_connectionSession;
-@property(retain) dispatch_queue_t workQueue; // @synthesize workQueue=_workQueue;
-@property(copy) NSString *sessionDescription; // @synthesize sessionDescription=_sessionDescription;
-@property(readonly) id <NSURLSessionDelegate> delegate; // @synthesize delegate=_delegate;
-@property(readonly) NSOperationQueue *delegateQueue; // @synthesize delegateQueue=_delegateQueue;
-@property(copy) __NSCFURLSessionConfiguration *configuration;
+@property(copy) NSString *sessionDescription;
+@property(readonly) id <NSURLSessionDelegate> delegate;
+@property(readonly) NSOperationQueue *delegateQueue;
+@property(readonly, copy) NSURLSessionConfiguration *configuration;
+
+- (void)_taskDidComplete:(NSURLSessionTask *)task;
+- (void)_completeInvalidationIfNeeded;
+- (void)_scheduleTask:(NSURLSessionTask *)task;
 
 + (id)sessionWithConfiguration:(id)configuration delegate:(id)delegate delegateQueue:(id)delegateQueue;
 + (id)sessionWithConfiguration:(id)configuration;
@@ -94,17 +91,14 @@ __attribute__((visibility("hidden")))
 - (NSURLSessionDataTask *)dataTaskWithHTTPGetRequest:(NSURL *)url;
 - (NSURLSessionDataTask *)dataTaskWithHTTPGetRequest:(NSURL *)url completionHandler:(void (^)(NSData *data, NSURLResponse *response, NSError *error))completionHandler;
 
-- (void)getTasksWithCompletionHandler:(id)handler;
-- (void)flushWithCompletionHandler:(id)handler;
-- (void)resetWithCompletionHandler:(id)handler;
+- (void)getTasksWithCompletionHandler:(void (^)(NSArray *, NSArray *, NSArray *))handler;
 - (void)finishTasksAndInvalidate;
 - (void)invalidateAndCancel;
-- (void)_onqueue_completeInvalidation:(BOOL)completeInvalidation;
-- (void)_onqueue_completeInvalidationFinal;
-- (void)_onqueue_withTasks:(id)tasks;
-- (BOOL)isBackgroundSession;
-- (id)getConfiguration;
-- (void)dealloc;
-- (id)copyWithZone:(NSZone *)zone;
 
 @end
+
+/* Owned data-task provider. Download/upload factories are not implemented by it. */
+__attribute__((visibility("hidden")))
+NSURLSessionDataTask *_NSCFURLSessionCreateDataTask(__NSCFURLSession *session,
+    NSURLRequest *request, NSUInteger identifier,
+    void (^completion)(NSData *, NSURLResponse *, NSError *));

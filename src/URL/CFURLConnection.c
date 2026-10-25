@@ -140,6 +140,7 @@ struct _CFURLConnection {
     Boolean valid;
     Boolean streamValid;
     Boolean finished;
+    volatile int32_t cancelled;
 
     CFHTTPMessageRef message;
     CFURLRequestRef request;
@@ -231,6 +232,7 @@ static void __CFURLConnectionDeallocate(CFTypeRef cf) {
         CFRelease(connection->modes);
         connection->modes = NULL;
     }
+    pthread_mutex_destroy(&connection->modeLock);
 }
 
 static CFTypeID __kCFURLConnectionTypeID = _kCFRuntimeNotATypeID;
@@ -317,6 +319,9 @@ static Boolean noopCredentialStorage(const void *info) {
 }
 
 static void openConnection(struct _CFURLConnection * connection) {
+    /* Cancelled queued connections must never be resurrected by the manager. */
+    if (OSAtomicAdd32Barrier(0, &connection->cancelled))
+        return;
     if (replayCached(connection)) {
         return;
     }
@@ -331,6 +336,11 @@ static void openConnection(struct _CFURLConnection * connection) {
 
     connection->streamValid = true;
     connection->valid = true;
+    if (OSAtomicAdd32Barrier(0, &connection->cancelled)) {
+        connection->streamValid = false;
+        connection->valid = false;
+        return;
+    }
     connection->lastScheduleTime = CFAbsoluteTimeGetCurrent();
     CFReadStreamScheduleWithRunLoop(connection->stream, CFRunLoopGetCurrent(), kCFRunLoopCommonModes);
     CFReadStreamOpen(connection->stream);
@@ -361,8 +371,13 @@ static void queueConnectionEvent(struct _CFURLConnection *connection,
     CFRelease(event);
     OSSpinLockUnlock(&connection->eventsLock);
 
-    CFRunLoopSourceSignal(connection->source);
-    CFRunLoopWakeUp(connection->runLoop);
+    /* Last-unschedule may detach the source while the manager queues an event. */
+    pthread_mutex_lock(&connection->modeLock);
+    if (connection->source) {
+        CFRunLoopSourceSignal(connection->source);
+        CFRunLoopWakeUp(connection->runLoop);
+    }
+    pthread_mutex_unlock(&connection->modeLock);
 
     switch (type) {
         case kConnectionEventGotResponse: {
@@ -392,7 +407,7 @@ static void queueConnectionEvent(struct _CFURLConnection *connection,
 static ConnectionEvent *dequeueConnectionEvent(struct _CFURLConnection *connection) {
     ConnectionEvent *event = NULL;
     OSSpinLockLock(&connection->eventsLock);
-    if (CFArrayGetCount(connection->events)) {
+    if (connection->events && CFArrayGetCount(connection->events)) {
         event = (ConnectionEvent *)CFRetain(CFArrayGetValueAtIndex(connection->events, 0));
         CFArrayRemoveValueAtIndex(connection->events, 0);
     }
@@ -708,8 +723,10 @@ CFURLConnectionRef CFURLConnectionCreate(CFAllocatorRef allocator, CFURLRequestR
 
     CFIndex size = sizeof(struct _CFURLConnection) - sizeof(CFRuntimeBase);
     struct _CFURLConnection *connection = (struct _CFURLConnection *)_CFRuntimeCreateInstance(allocator, CFURLConnectionGetTypeID(), size, NULL);
+    pthread_mutex_init(&connection->modeLock, NULL);
 
     connection->finished = false;
+    connection->cancelled = 0;
 
     connection->request = (CFURLRequestRef)CFRetain(request);
 
@@ -807,6 +824,8 @@ void CFURLConnectionSetHandler(CFURLConnectionRef conn, const CFURLConnectionHan
 }
 
 static void connectionSourcePerform(struct _CFURLConnection *connection) {
+    /* A terminal callback may cancel and detach this source reentrantly. */
+    CFRetain(connection);
     ConnectionEvent *event;
     while ((event = dequeueConnectionEvent(connection))) {
         switch (event->type) {
@@ -852,23 +871,35 @@ static void connectionSourcePerform(struct _CFURLConnection *connection) {
             break;
         }
     }
+    CFRelease(connection);
 }
 
 static void unscheduleFromRunLoops(struct _CFURLConnection *connection) {
+    CFRetain(connection);
     pthread_mutex_lock(&connection->modeLock);
-    for (CFIndex idx = 0; idx < CFArrayGetCount(connection->modes); idx++) {
-        CFStringRef runLoopMode = (CFStringRef)CFArrayGetValueAtIndex(connection->modes, idx);
-        CFRunLoopRemoveSource(connection->runLoop, connection->source, runLoopMode);
+    CFRunLoopSourceRef source = connection->source;
+    if (source) {
+        CFRetain(source);
+        connection->source = NULL;
+        for (CFIndex idx = 0; idx < CFArrayGetCount(connection->modes); idx++) {
+            CFStringRef mode = CFArrayGetValueAtIndex(connection->modes, idx);
+            CFRunLoopRemoveSource(connection->runLoop, source, mode);
+        }
+        CFArrayRemoveAllValues(connection->modes);
     }
-    CFArrayRemoveAllValues(connection->modes);
     pthread_mutex_unlock(&connection->modeLock);
+    if (source) {
+        CFRunLoopSourceInvalidate(source);
+        CFRelease(source);
+    }
+    CFRelease(connection);
 }
 
 void CFURLConnectionScheduleWithRunLoop(CFURLConnectionRef conn, CFRunLoopRef runLoop, CFStringRef runLoopMode) {
     struct _CFURLConnection *connection = (struct _CFURLConnection*)conn;
-
+    pthread_mutex_lock(&connection->modeLock);
     Boolean createdSource = false;
-    if(connection->source == NULL) {
+    if (connection->source == NULL) {
         CFRunLoopSourceContext context = {
             .version = 0,
             .info = connection,
@@ -877,34 +908,50 @@ void CFURLConnectionScheduleWithRunLoop(CFURLConnectionRef conn, CFRunLoopRef ru
             .release = &CFRelease
         };
         connection->source = CFRunLoopSourceCreate(NULL, 0, &context);
-        connection->runLoop = (CFRunLoopRef)CFRetain(CFRunLoopGetCurrent());
-        connection->modes = CFArrayCreateMutable(kCFAllocatorDefault, 0, &kCFTypeArrayCallBacks);
+        if (connection->runLoop)
+            CFRelease(connection->runLoop);
+        connection->runLoop = (CFRunLoopRef)CFRetain(runLoop);
+        if (!connection->modes)
+            connection->modes = CFArrayCreateMutable(kCFAllocatorDefault, 0, &kCFTypeArrayCallBacks);
         createdSource = true;
     }
-
-    pthread_mutex_lock(&connection->modeLock);
-    CFArrayAppendValue(connection->modes, runLoopMode);
-    pthread_mutex_unlock(&connection->modeLock);
-
+    if (!CFArrayContainsValue(connection->modes, CFRangeMake(0, CFArrayGetCount(connection->modes)), runLoopMode))
+        CFArrayAppendValue(connection->modes, runLoopMode);
     CFRunLoopAddSource(runLoop, connection->source, runLoopMode);
+    /* Events buffered while detached must become deliverable on resume. */
+    CFRunLoopSourceSignal(connection->source);
     if (createdSource)
-    {
-        CFRelease(connection->source);
-    }
+        CFRelease(connection->source); /* The run loop now owns the source. */
+    pthread_mutex_unlock(&connection->modeLock);
     CFRunLoopWakeUp(runLoop);
 }
 
 void CFURLConnectionUnscheduleFromRunLoop(CFURLConnectionRef conn, CFRunLoopRef runLoop, CFStringRef runLoopMode) {
     struct _CFURLConnection *connection = (struct _CFURLConnection*)conn;
-
+    CFRetain(connection);
+    CFRunLoopSourceRef detached = NULL;
     pthread_mutex_lock(&connection->modeLock);
-    CFIndex idx = CFArrayGetFirstIndexOfValue(connection->modes, CFRangeMake(0, CFArrayGetCount(connection->modes)), runLoopMode);
-    if (idx != kCFNotFound) {
-        CFArrayRemoveValueAtIndex(connection->modes, idx);
+    if (connection->source) {
+        CFIndex idx = CFArrayGetFirstIndexOfValue(connection->modes,
+            CFRangeMake(0, CFArrayGetCount(connection->modes)), runLoopMode);
+        if (idx != kCFNotFound) {
+            CFArrayRemoveValueAtIndex(connection->modes, idx);
+            detached = (CFRunLoopSourceRef)CFRetain(connection->source);
+            CFRunLoopRemoveSource(runLoop, detached, runLoopMode);
+            if (CFArrayGetCount(connection->modes) == 0)
+                connection->source = NULL;
+            else {
+                CFRelease(detached);
+                detached = NULL;
+            }
+        }
     }
     pthread_mutex_unlock(&connection->modeLock);
-
-    CFRunLoopRemoveSource(runLoop, connection->source, runLoopMode);
+    if (detached) {
+        CFRunLoopSourceInvalidate(detached);
+        CFRelease(detached);
+    }
+    CFRelease(connection);
 }
 
 static void enqueueConnection(CFURLConnectionRef connection) {
@@ -1005,6 +1052,11 @@ static void updateQueue(void *ctx) {
         if (connection != NULL) {
             int found = -1;
             OSSpinLockLock(&queue_lock);
+            if (OSAtomicAdd32Barrier(0, &connection->cancelled)) {
+                OSSpinLockUnlock(&queue_lock);
+                CFRelease(connection);
+                continue;
+            }
             for (int i = 0; i < NUM_QUEUES; i++) {
                 if (activeConnections[i] == NULL) {
                     // dequeueConnection returns retained, so we don't retain here
@@ -1095,7 +1147,9 @@ void CFURLConnectionStart(CFURLConnectionRef conn) {
 
 void CFURLConnectionCancel(CFURLConnectionRef conn) {
     struct _CFURLConnection *connection = (struct _CFURLConnection*)conn;
+    OSAtomicCompareAndSwap32Barrier(0, 1, &connection->cancelled);
     broadcastConnectionState(connection, true);
+    unscheduleFromRunLoops(connection);
 }
 
 Boolean CFURLConnectionGetResponse(CFURLConnectionRef conn, CFURLResponseRef *response, CFErrorRef *error) {
