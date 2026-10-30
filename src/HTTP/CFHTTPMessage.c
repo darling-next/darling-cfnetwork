@@ -657,9 +657,11 @@ extern void _CFHTTPMessageSetHeader(CFHTTPMessageRef msg, CFStringRef header, CF
 
     if (!value) {
         CFDictionaryRemoveValue(msg->_headers, header);
-        CFArrayRemoveValueAtIndex(msg->_headerOrder,
-                                  CFArrayGetFirstIndexOfValue(msg->_headerOrder, CFRangeMake(0, CFArrayGetCount(msg->_headerOrder)),
-                                  header));
+        CFIndex index = CFArrayGetFirstIndexOfValue(msg->_headerOrder,
+            CFRangeMake(0, CFArrayGetCount(msg->_headerOrder)), header);
+        /* Removing an absent HTTP field is an idempotent operation. */
+        if (index != kCFNotFound)
+            CFArrayRemoveValueAtIndex(msg->_headerOrder, index);
     }
     else {
         if (!CFDictionaryContainsKey(msg->_headers, header)) {

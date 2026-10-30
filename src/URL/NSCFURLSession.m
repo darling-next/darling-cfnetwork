@@ -222,8 +222,13 @@ static void sessionWorkerCommand(void *info)
 - (void)getTasksWithCompletionHandler:(void (^)(NSArray *, NSArray *, NSArray *))handler
 {
     @synchronized (self) {
-        NSArray *tasks = [_tasks allObjects];
-        [self addDelegateBlock:^{ handler(tasks, [NSArray array], [NSArray array]); }];
+        NSMutableArray *data = [NSMutableArray array], *uploads = [NSMutableArray array], *downloads = [NSMutableArray array];
+        for (NSURLSessionTask *task in _tasks) {
+            if ([task isKindOfClass:[NSURLSessionDownloadTask class]]) [downloads addObject:task];
+            else if ([task isKindOfClass:[NSURLSessionUploadTask class]]) [uploads addObject:task];
+            else [data addObject:task];
+        }
+        [self addDelegateBlock:^{ handler(data, uploads, downloads); }];
     }
 }
 
@@ -534,11 +539,10 @@ static void sessionWorkerCommand(void *info)
     return [self downloadTaskWithResumeData:resumeData completionHandler:nil];
 }
 
-- (NSURLSessionDownloadTask *)downloadTaskWithResumeData:(NSData *)resumeData completionHandler:(void (^)(NSData *data, NSURLResponse *response, NSError *error))completionHandler
+- (NSURLSessionDownloadTask *)downloadTaskWithResumeData:(NSData *)resumeData completionHandler:(void (^)(NSURL *location, NSURLResponse *response, NSError *error))completionHandler
 {
-    NSURLSessionDownloadTask *task = [[NSURLSessionDownloadTask alloc] initWithResumeData:resumeData completionHandler:completionHandler];
-
-    return [task autorelease];
+    [NSException raise:NSInvalidArgumentException format:@"This provider cannot restore opaque download resume data"];
+    return nil;
 }
 
 - (NSURLSessionDownloadTask *)downloadTaskWithURL:(NSURL *)url
@@ -546,7 +550,7 @@ static void sessionWorkerCommand(void *info)
     return [self downloadTaskWithURL:url completionHandler:nil];
 }
 
-- (NSURLSessionDownloadTask *)downloadTaskWithURL:(NSURL *)url completionHandler:(void (^)(NSData *data, NSURLResponse *response, NSError *error))completionHandler
+- (NSURLSessionDownloadTask *)downloadTaskWithURL:(NSURL *)url completionHandler:(void (^)(NSURL *location, NSURLResponse *response, NSError *error))completionHandler
 {
     return [self downloadTaskWithRequest:[NSURLRequest requestWithURL:url] completionHandler:completionHandler];
 }
@@ -556,11 +560,15 @@ static void sessionWorkerCommand(void *info)
     return [self downloadTaskWithRequest:request completionHandler:nil];
 }
 
-- (NSURLSessionDownloadTask *)downloadTaskWithRequest:(NSURLRequest *)request completionHandler:(void (^)(NSData *data, NSURLResponse *response, NSError *error))completionHandler
+- (NSURLSessionDownloadTask *)downloadTaskWithRequest:(NSURLRequest *)request completionHandler:(void (^)(NSURL *location, NSURLResponse *response, NSError *error))completionHandler
 {
-    NSURLSessionDownloadTask *task = [[NSURLSessionDownloadTask alloc] initWithCompletionHandler:completionHandler];
-
-    return [task autorelease];
+    @synchronized (self) {
+        if (_invalid)
+            [NSException raise:NSGenericException format:@"Cannot create a task in an invalidated session"];
+        NSURLSessionDownloadTask *task = _NSCFURLSessionCreateDownloadTask(self, request, _nextTaskIdentifier++, completionHandler);
+        if (task) [_tasks addObject:task];
+        return [task autorelease];
+    }
 }
 
 - (NSURLSessionUploadTask *)uploadTaskWithRequest:(NSURLRequest *)request fromFile:(NSURL *)fileURL
@@ -628,6 +636,27 @@ static void sessionWorkerCommand(void *info)
 - (NSURLSessionDataTask *)dataTaskWithHTTPGetRequest:(NSURL *)url completionHandler:(void (^)(NSData *data, NSURLResponse *response, NSError *error))completionHandler
 {
     return [self dataTaskWithRequest:[NSURLRequest requestWithURL:url] completionHandler:completionHandler];
+}
+
+- (NSURLSessionWebSocketTask *)webSocketTaskWithRequest:(NSURLRequest *)request
+{
+    @synchronized (self) {
+        if (_invalid)
+            [NSException raise:NSGenericException format:@"Cannot create a task in an invalidated session"];
+        NSURLSessionWebSocketTask *task = _NSCFURLSessionCreateWebSocketTask(self, request, _nextTaskIdentifier++);
+        if (task) [_tasks addObject:task];
+        return [task autorelease];
+    }
+}
+- (NSURLSessionWebSocketTask *)webSocketTaskWithURL:(NSURL *)url
+{
+    return [self webSocketTaskWithRequest:[NSURLRequest requestWithURL:url]];
+}
+- (NSURLSessionWebSocketTask *)webSocketTaskWithURL:(NSURL *)url protocols:(NSArray *)protocols
+{
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
+    [request setValue:[protocols componentsJoinedByString:@", "] forHTTPHeaderField:@"Sec-WebSocket-Protocol"];
+    return [self webSocketTaskWithRequest:request];
 }
 
 

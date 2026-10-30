@@ -74,11 +74,11 @@ __attribute__((visibility("hidden")))
 - (void)addDelegateBlock:(void (^)(void))block;
 
 - (NSURLSessionDownloadTask *)downloadTaskWithResumeData:(NSData *)resumeData;
-- (NSURLSessionDownloadTask *)downloadTaskWithResumeData:(NSData *)resumeData completionHandler:(void (^)(NSData *data, NSURLResponse *response, NSError *error))completionHandler;
+- (NSURLSessionDownloadTask *)downloadTaskWithResumeData:(NSData *)resumeData completionHandler:(void (^)(NSURL *location, NSURLResponse *response, NSError *error))completionHandler;
 - (NSURLSessionDownloadTask *)downloadTaskWithURL:(NSURL *)url;
-- (NSURLSessionDownloadTask *)downloadTaskWithURL:(NSURL *)url completionHandler:(void (^)(NSData *data, NSURLResponse *response, NSError *error))completionHandler;
+- (NSURLSessionDownloadTask *)downloadTaskWithURL:(NSURL *)url completionHandler:(void (^)(NSURL *location, NSURLResponse *response, NSError *error))completionHandler;
 - (NSURLSessionDownloadTask *)downloadTaskWithRequest:(NSURLRequest *)request;
-- (NSURLSessionDownloadTask *)downloadTaskWithRequest:(NSURLRequest *)request completionHandler:(void (^)(NSData *data, NSURLResponse *response, NSError *error))completionHandler;
+- (NSURLSessionDownloadTask *)downloadTaskWithRequest:(NSURLRequest *)request completionHandler:(void (^)(NSURL *location, NSURLResponse *response, NSError *error))completionHandler;
 - (NSURLSessionUploadTask *)uploadTaskWithRequest:(NSURLRequest *)request fromFile:(NSURL *)fileURL;
 - (NSURLSessionUploadTask *)uploadTaskWithRequest:(NSURLRequest *)request fromFile:(NSURL *)fileURL completionHandler:(void (^)(NSData *data, NSURLResponse *response, NSError *error))completionHandler;
 - (NSURLSessionUploadTask *)uploadTaskWithRequest:(NSURLRequest *)request fromData:(NSData *)bodyData;
@@ -97,8 +97,15 @@ __attribute__((visibility("hidden")))
 
 @end
 
-/* Owned data-task provider. Download/upload factories are not implemented by it. */
+/* Native providers share the session's worker and task lifecycle registry. */
 __attribute__((visibility("hidden")))
 NSURLSessionDataTask *_NSCFURLSessionCreateDataTask(__NSCFURLSession *session,
     NSURLRequest *request, NSUInteger identifier,
     void (^completion)(NSData *, NSURLResponse *, NSError *));
+__attribute__((visibility("hidden")))
+NSURLSessionDownloadTask *_NSCFURLSessionCreateDownloadTask(__NSCFURLSession *session,
+    NSURLRequest *request, NSUInteger identifier,
+    void (^completion)(NSURL *, NSURLResponse *, NSError *));
+__attribute__((visibility("hidden")))
+NSURLSessionWebSocketTask *_NSCFURLSessionCreateWebSocketTask(__NSCFURLSession *session,
+    NSURLRequest *request, NSUInteger identifier);

@@ -64,7 +64,7 @@ NSString* const NSURLSessionDownloadTaskResumeData = @"NSURLSessionDownloadTaskR
 @implementation NSURLSessionTask
 @dynamic taskIdentifier, originalRequest, currentRequest, response, error;
 @dynamic countOfBytesReceived, countOfBytesSent, countOfBytesExpectedToSend, countOfBytesExpectedToReceive;
-@dynamic taskDescription, state;
+@dynamic taskDescription, state, delegate;
 @end
 
 @implementation NSURLSessionDataTask
@@ -98,6 +98,7 @@ NSString* const NSURLSessionDownloadTaskResumeData = @"NSURLSessionDownloadTaskR
     NSURLRequest *_currentRequest;
     NSURLResponse *_response;
     NSError *_error;
+    id<NSURLSessionTaskDelegate> _taskDelegate;
     NSString *_taskDescription;
     NSUInteger _identifier;
     NSURLSessionTaskState _state;
@@ -165,6 +166,7 @@ NSURLSessionDataTask *_NSCFURLSessionCreateDataTask(__NSCFURLSession *session,
     [_data release];
     [_completion release];
     [_loadingError release];
+    [_taskDelegate release];
     [_hostOverride release];
     [super dealloc];
 }
@@ -195,6 +197,8 @@ NSURLSessionDataTask *_NSCFURLSessionCreateDataTask(__NSCFURLSession *session,
     }
 }
 
+- (id<NSURLSessionTaskDelegate>)delegate { @synchronized(self) { return [[(_taskDelegate ?: (id)_session.delegate) retain] autorelease]; } }
+- (void)setDelegate:(id<NSURLSessionTaskDelegate>)value { @synchronized(self) { [value retain]; [_taskDelegate release]; _taskDelegate = value; } }
 - (NSObject<OS_nw_endpoint> *)_hostOverride
 {
     @synchronized (self) {
@@ -409,8 +413,8 @@ NSURLSessionDataTask *_NSCFURLSessionCreateDataTask(__NSCFURLSession *session,
             @try {
                 if (completion)
                     completion(data, response, error);
-                else if ([session.delegate respondsToSelector:@selector(URLSession:task:didCompleteWithError:)])
-                    [(id<NSURLSessionTaskDelegate>)session.delegate URLSession:session task:self didCompleteWithError:error];
+                else if ([self.delegate respondsToSelector:@selector(URLSession:task:didCompleteWithError:)])
+                    [self.delegate URLSession:session task:self didCompleteWithError:error];
             } @finally {
                 [session _taskDidComplete:self];
                 @synchronized (self) {
@@ -503,6 +507,9 @@ NSURLSessionDataTask *_NSCFURLSessionCreateDataTask(__NSCFURLSession *session,
 }
 
 @end
+
+#include "NSURLSessionDownload.inc"
+#include "NSURLSessionWebSocket.inc"
 
 @implementation NSURLSessionConfiguration
 
