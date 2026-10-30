@@ -65,6 +65,7 @@
     uint8_t _fragmentOpcode;
     NSMutableArray *_writes, *_messages, *_receivers, *_pongs;
     NSString *_accept;
+    NSString *_protocols;
     NSData *_pingNonce;
     NSInteger _maximum;
     NSURLSessionWebSocketCloseCode _closeCode;
@@ -130,6 +131,17 @@ static BOOL webSocketProtocol(NSString *offered, NSString *selected)
         if ([[part stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]] isEqualToString:selected]) return YES;
     return NO;
 }
+static BOOL webSocketOfferedProtocols(NSString *offered)
+{
+    if (!offered) return YES;
+    NSMutableSet *seen = [NSMutableSet set];
+    for (NSString *part in [offered componentsSeparatedByString:@","]) {
+        NSString *token = [part stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        if (!webSocketFieldName(token) || [seen containsObject:token]) return NO;
+        [seen addObject:token];
+    }
+    return YES;
+}
 static BOOL webSocketCloseCode(NSUInteger code)
 {
     return (code >= 1000 && code <= 1014 && code != 1004 && code != 1005 && code != 1006) || (code >= 3000 && code <= 4999);
@@ -159,6 +171,7 @@ NSURLSessionWebSocketTask *_NSCFURLSessionCreateWebSocketTask(__NSCFURLSession *
     [_session release]; [_request release]; [_response release]; [_delegate release]; [_description release]; [_error release];
     [_input release]; [_output release]; [_incoming release]; [_fragment release]; [_writes release]; [_messages release]; [_receivers release]; [_pongs release];
     [_accept release]; [_closeReason release];
+    [_protocols release];
     [_pingNonce release];
     [_pendingError release];
     if (_timer) { CFRunLoopTimerInvalidate(_timer); CFRelease(_timer); }
@@ -233,6 +246,11 @@ NSURLSessionWebSocketTask *_NSCFURLSessionCreateWebSocketTask(__NSCFURLSession *
             CFHTTPMessageSetHeaderFieldValue(request, CFSTR("Sec-WebSocket-Version"), CFSTR("13"));
             /* Extensions cannot be requested without a corresponding frame decoder. */
             CFHTTPMessageSetHeaderFieldValue(request, CFSTR("Sec-WebSocket-Extensions"), NULL);
+            _protocols = (NSString *)CFHTTPMessageCopyHeaderFieldValue(request, CFSTR("Sec-WebSocket-Protocol"));
+            if (!webSocketOfferedProtocols(_protocols)) {
+                CFRelease(request);
+                [self _finish:webSocketError(NSURLErrorBadURL, @"Invalid WebSocket subprotocol offer")]; return;
+            }
             __NSCFWebSocketWrite *write = [[[__NSCFWebSocketWrite alloc] init] autorelease];
             write->bytes = (NSData *)CFHTTPMessageCopySerializedMessage(request); CFRelease(request); [_writes insertObject:write atIndex:0];
             CFReadStreamRef input = NULL; CFWriteStreamRef output = NULL;
@@ -444,8 +462,13 @@ NSURLSessionWebSocketTask *_NSCFURLSessionCreateWebSocketTask(__NSCFURLSession *
         NSString *accept = [(id)CFHTTPMessageCopyHeaderFieldValue(response, CFSTR("Sec-WebSocket-Accept")) autorelease];
         NSString *extensions = [(id)CFHTTPMessageCopyHeaderFieldValue(response, CFSTR("Sec-WebSocket-Extensions")) autorelease];
         NSString *protocol = [(id)CFHTTPMessageCopyHeaderFieldValue(response, CFSTR("Sec-WebSocket-Protocol")) autorelease];
-        valid = valid && webSocketToken(upgrade, @"websocket") && webSocketToken(connection, @"Upgrade") && [accept isEqualToString:_accept] && ![extensions length];
-        if (protocol) valid = valid && webSocketProtocol([_request valueForHTTPHeaderField:@"Sec-WebSocket-Protocol"], protocol);
+        NSString *version = [(id)CFHTTPMessageCopyVersion(response) autorelease];
+        /* Upgrade's value is the websocket protocol, whereas Connection is a
+         * token list. RFC 6455 section 4.1 requires that distinction. */
+        valid = valid && [version isEqualToString:@"HTTP/1.1"] && [upgrade length] &&
+            [[upgrade stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]] caseInsensitiveCompare:@"websocket"] == NSOrderedSame &&
+            webSocketToken(connection, @"Upgrade") && [accept isEqualToString:_accept] && ![extensions length];
+        if (protocol) valid = valid && webSocketProtocol(_protocols, protocol);
         NSDictionary *fields = [(id)CFHTTPMessageCopyAllHeaderFields(response) autorelease];
         _response = [[NSHTTPURLResponse alloc] initWithURL:[_request URL] statusCode:CFHTTPMessageGetResponseStatusCode(response) HTTPVersion:@"HTTP/1.1" headerFields:fields];
         CFRelease(response);
