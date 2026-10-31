@@ -279,8 +279,13 @@ NSURLSessionWebSocketTask *_NSCFURLSessionCreateWebSocketTask(__NSCFURLSession *
         if (_inputPaused && !_protocolFailure && (_closing || (![_messages count] && !_deliveries))) {
             [_input scheduleInRunLoop:[NSRunLoop currentRunLoop] forMode:NSDefaultRunLoopMode]; _inputPaused = NO;
         }
-        [self _readAvailable];
+        /* Put the handshake (and any queued application frame) on the wire
+         * before considering a read. Both streams are serviced by this one
+         * session worker, so a read that waits for the peer cannot be
+         * unblocked by a write that has not been issued yet; the request must
+         * precede the response that the read is waiting for. */
         [self _flush];
+        [self _readAvailable];
     }
 }
 - (void)_finish:(NSError *)error

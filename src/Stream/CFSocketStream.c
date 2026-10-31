@@ -1782,6 +1782,17 @@ _SocketCallBack(CFSocketRef s, CFSocketCallBackType type, CFDataRef address, con
 				}
 				
 				else {
+					/* The socket manager signals a level-triggered read event,
+					 * but a read already issued from an earlier signal can
+					 * consume the bytes before this callback runs. Believing
+					 * the stale signal would advertise bytes that are gone;
+					 * the next read would then fall into the readiness wait
+					 * below and expire as a fatal ETIMEDOUT. Recheck the
+					 * descriptor exactly as _SocketStreamRead already does
+					 * when it converts the wait into has-bytes. */
+					if (ctxt->_socket && CFSocketIsValid(ctxt->_socket) && !_CFSocketCan(ctxt->_socket, kSelectModeRead)) {
+						break;
+					}
 					__CFBitSet(ctxt->_flags, kFlagBitCanRead);
 					__CFBitClear(ctxt->_flags, kFlagBitPollRead);
 					event = kCFStreamEventHasBytesAvailable;
