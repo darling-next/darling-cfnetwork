@@ -270,7 +270,9 @@ NSURLSessionWebSocketTask *_NSCFURLSessionCreateWebSocketTask(__NSCFURLSession *
             [self _setTimeout:[_request timeoutInterval]];
             [_input open]; [_output open];
         } else if (!_scheduled) {
-            [_input scheduleInRunLoop:[NSRunLoop currentRunLoop] forMode:NSDefaultRunLoopMode]; [_output scheduleInRunLoop:[NSRunLoop currentRunLoop] forMode:NSDefaultRunLoopMode]; _scheduled = YES; _inputPaused = NO;
+            if (!_protocolFailure) [_input scheduleInRunLoop:[NSRunLoop currentRunLoop] forMode:NSDefaultRunLoopMode];
+            [_output scheduleInRunLoop:[NSRunLoop currentRunLoop] forMode:NSDefaultRunLoopMode];
+            _scheduled = YES; _inputPaused = _protocolFailure != nil;
         }
         if (_pendingError) { [self _finish:_pendingError]; return; }
         if (_closing && _upgraded && !_closeTimerStarted) { _closeTimerStarted = YES; [self _setTimeout:5]; }
@@ -489,14 +491,14 @@ NSURLSessionWebSocketTask *_NSCFURLSessionCreateWebSocketTask(__NSCFURLSession *
      * then drain a masked RFC 6455 failure Close before ending the transport.
      * A blocked peer still has the ordinary bounded close deadline. */
     NSUInteger keep = [_writes count] && ((__NSCFWebSocketWrite *)[_writes objectAtIndex:0])->offset ? 1 : 0;
-    while ([_writes count] > keep) {
-        __NSCFWebSocketWrite *write = [_writes objectAtIndex:keep];
+    for (__NSCFWebSocketWrite *write in _writes) {
         if (write->completion) {
             void (^completion)(NSError *) = [[write->completion copy] autorelease];
+            [write->completion release]; write->completion = nil;
             [_session addDelegateBlock:^{ completion(error); }];
         }
-        [_writes removeObjectAtIndex:keep];
     }
+    while ([_writes count] > keep) [_writes removeObjectAtIndex:keep];
     if (!keep || !((__NSCFWebSocketWrite *)[_writes objectAtIndex:0])->closeFrame) {
         uint8_t payload[2] = { code >> 8, code };
         [self _frame:8 data:[NSData dataWithBytes:payload length:sizeof(payload)] completion:nil];
