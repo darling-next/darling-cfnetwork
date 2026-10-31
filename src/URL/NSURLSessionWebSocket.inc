@@ -40,6 +40,7 @@
     NSUInteger offset;
     void (^completion)(NSError *);
     BOOL closeFrame;
+    BOOL automaticPong;
 }
 @end
 @implementation __NSCFWebSocketWrite
@@ -324,7 +325,23 @@ NSURLSessionWebSocketTask *_NSCFURLSessionCreateWebSocketTask(__NSCFURLSession *
     NSMutableData *frame = [NSMutableData dataWithLength:count + length]; memcpy([frame mutableBytes], header, count);
     uint8_t *destination = (uint8_t *)[frame mutableBytes] + count; const uint8_t *source = [data bytes];
     for (NSUInteger i = 0; i < length; ++i) destination[i] = source[i] ^ mask[i & 3];
-    __NSCFWebSocketWrite *write = [[[__NSCFWebSocketWrite alloc] init] autorelease]; write->bytes = [frame retain]; write->completion = [completion copy]; write->closeFrame = opcode == 8; [_writes addObject:write];
+    if (opcode == 10) {
+        /* RFC 6455 section 5.5.2 permits replying only to the most recently
+         * processed Ping when older replies have not been sent. Never replace
+         * a partially written frame: its wire prefix already belongs to it.
+         * Thus a blocked peer can retain at most one partial and one unsent
+         * automatic Pong, regardless of how many Pings it sends. */
+        for (__NSCFWebSocketWrite *pending in _writes) {
+            if (pending->automaticPong && !pending->offset) {
+                [pending->bytes release]; pending->bytes = [frame retain];
+                return;
+            }
+        }
+    }
+    __NSCFWebSocketWrite *write = [[[__NSCFWebSocketWrite alloc] init] autorelease];
+    write->bytes = [frame retain]; write->completion = [completion copy];
+    write->closeFrame = opcode == 8; write->automaticPong = opcode == 10;
+    [_writes addObject:write];
 }
 - (void)sendMessage:(NSURLSessionWebSocketMessage *)message completionHandler:(void (^)(NSError *))completion
 {
@@ -427,14 +444,24 @@ NSURLSessionWebSocketTask *_NSCFURLSessionCreateWebSocketTask(__NSCFURLSession *
 }
 - (void)_readAvailable
 {
-    [self _consume];
+    @autoreleasepool { [self _consume]; }
     uint8_t bytes[16384];
-    while (_state == NSURLSessionTaskStateRunning && (_closing || (![_messages count] && !_deliveries)) && [_input hasBytesAvailable]) {
-        NSInteger count = [_input read:bytes maxLength:sizeof(bytes)];
-        if (count < 0) { [self _finish:[_input streamError] ?: webSocketError(NSURLErrorNetworkConnectionLost, @"WebSocket read failed")]; return; }
-        if (!count) break;
-        _received += count; [_incoming appendBytes:bytes length:count]; [self _consume];
+    NSUInteger reads = 16;
+    while (reads && _state == NSURLSessionTaskStateRunning && (_closing || (![_messages count] && !_deliveries)) && [_input hasBytesAvailable]) {
+        --reads;
+        /* Bound transient autoreleased frame/payload objects even when a peer
+         * continuously supplies control frames and the run loop cannot drain. */
+        @autoreleasepool {
+            NSInteger count = [_input read:bytes maxLength:sizeof(bytes)];
+            if (count < 0) { [self _finish:[_input streamError] ?: webSocketError(NSURLErrorNetworkConnectionLost, @"WebSocket read failed")]; return; }
+            if (!count) break;
+            _received += count; [_incoming appendBytes:bytes length:count]; [self _consume];
+        }
     }
+    /* Yield the task lock/run loop between bounded batches so command traffic,
+     * especially cancellation, cannot be starved by an always-readable peer. */
+    if (!reads && _state == NSURLSessionTaskStateRunning && (_closing || (![_messages count] && !_deliveries)) && [_input hasBytesAvailable])
+        [_session _scheduleTask:self];
     /* One completed message plus at most one partial message/read chunk is
      * retained. Stop stream delivery as well as reads, avoiding a hot run loop.
      * Already-buffered control frames are parsed even with a pending message;
