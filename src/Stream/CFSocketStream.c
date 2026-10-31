@@ -2841,10 +2841,16 @@ _CFSocketSend(CFSocketRef s, const UInt8* buffer, CFIndex length, CFStreamError*
 	}
 	
 	else {		
-		/* Try to read some bytes off the socket. */
+		/* Send with the explicit no-SIGPIPE flag. On a connected socket
+		 * send(2) is write(2); the flag turns a peer-close write failure
+		 * into EPIPE for this operation instead of a fatal SIGPIPE. */
+#if !defined(__WIN32)
+		result = send(CFSocketGetNative(s), buffer, length, MSG_NOSIGNAL);
+#else
 		result = write(CFSocketGetNative(s), buffer, length);
+#endif
 		
-		/* If recv returned an error, get the error and make sure to return -1. */
+		/* If send returned an error, get the error and make sure to return -1. */
 		if (result < 0) {
 			_LastError(error);
 			result = -1;
@@ -3144,11 +3150,6 @@ _SocketStreamCreateSocket_NoLock(_CFSocketStreamContext* ctxt, CFDataRef address
             setsockopt(s, IPPROTO_IP, IP_TTL, (void*)&ttl, sizeof(ttl));
 		}
 		
-#if !defined(__WIN32)
-        /* Turn off SIGPIPE on the socket (SIGPIPE doesn't exist on WIN32) */
-        setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, (void*)&yes, sizeof(yes));
-#endif
-		
         /* Place the socket in nonblocking mode. */
         ioctl(s, FIONBIO, (void*)&yes);
 		
@@ -3412,11 +3413,6 @@ _SocketStreamAttemptNextConnection_NoLock(_CFSocketStreamContext* ctxt) {
 
 			/* Get the native socket for setting options. */
 			s = CFSocketGetNative(ctxt->_socket);
-			
-#if !defined(__WIN32)
-			/* Turn off SIGPIPE on the socket (SIGPIPE doesn't exist on WIN32) */
-			setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, (void*)&yes, sizeof(yes));
-#endif
 			
 			/* Place the socket in nonblocking mode. */
 			ioctl(s, FIONBIO, (void*)&yes);
