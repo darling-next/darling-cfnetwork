@@ -55,6 +55,7 @@
     NSString *_description;
     NSError *_error;
     NSError *_pendingError;
+    NSError *_protocolFailure;
     BOOL _closeTimerStarted;
     NSUInteger _identifier, _suspensions;
     NSURLSessionTaskState _state;
@@ -86,6 +87,7 @@
 - (void)_deliver;
 - (void)_sendNextPing;
 - (void)_timeout;
+- (void)_protocolError:(NSString *)description closeCode:(uint16_t)code;
 @end
 
 static NSError *webSocketError(NSInteger code, NSString *description)
@@ -175,6 +177,7 @@ NSURLSessionWebSocketTask *_NSCFURLSessionCreateWebSocketTask(__NSCFURLSession *
     [_protocols release];
     [_pingNonce release];
     [_pendingError release];
+    [_protocolFailure release];
     if (_timer) { CFRunLoopTimerInvalidate(_timer); CFRelease(_timer); }
     [super dealloc];
 }
@@ -271,7 +274,7 @@ NSURLSessionWebSocketTask *_NSCFURLSessionCreateWebSocketTask(__NSCFURLSession *
         }
         if (_pendingError) { [self _finish:_pendingError]; return; }
         if (_closing && _upgraded && !_closeTimerStarted) { _closeTimerStarted = YES; [self _setTimeout:5]; }
-        if (_inputPaused && (_closing || (![_messages count] && !_deliveries))) {
+        if (_inputPaused && !_protocolFailure && (_closing || (![_messages count] && !_deliveries))) {
             [_input scheduleInRunLoop:[NSRunLoop currentRunLoop] forMode:NSDefaultRunLoopMode]; _inputPaused = NO;
         }
         [self _readAvailable];
@@ -282,6 +285,7 @@ NSURLSessionWebSocketTask *_NSCFURLSessionCreateWebSocketTask(__NSCFURLSession *
 {
     @synchronized(self) {
         if (_state == NSURLSessionTaskStateCompleted) return;
+        if (_protocolFailure) error = _protocolFailure;
         if (_state == NSURLSessionTaskStateCanceling) error = webSocketError(NSURLErrorCancelled, @"The WebSocket task was cancelled");
         _state = NSURLSessionTaskStateCompleted; _error = [error retain];
         if (!_closeCode && error) _closeCode = NSURLSessionWebSocketCloseCodeAbnormalClosure;
@@ -428,7 +432,10 @@ NSURLSessionWebSocketTask *_NSCFURLSessionCreateWebSocketTask(__NSCFURLSession *
         void (^completion)(NSError *) = [[write->completion copy] autorelease];
         [_writes removeObjectAtIndex:0];
         if (completion) [_session addDelegateBlock:^{ completion(nil); }];
-        if (close) { _closeSent = YES; if (_closeReceived) { [self _finish:nil]; return; } }
+        if (close) {
+            _closeSent = YES;
+            if (_protocolFailure || _closeReceived) { [self _finish:_protocolFailure]; return; }
+        }
         if (!_upgraded) return;
     }
 }
@@ -447,7 +454,7 @@ NSURLSessionWebSocketTask *_NSCFURLSessionCreateWebSocketTask(__NSCFURLSession *
     @autoreleasepool { [self _consume]; }
     uint8_t bytes[16384];
     NSUInteger reads = 16;
-    while (reads && _state == NSURLSessionTaskStateRunning && (_closing || (![_messages count] && !_deliveries)) && [_input hasBytesAvailable]) {
+    while (reads && !_protocolFailure && _state == NSURLSessionTaskStateRunning && (_closing || (![_messages count] && !_deliveries)) && [_input hasBytesAvailable]) {
         --reads;
         /* Bound transient autoreleased frame/payload objects even when a peer
          * continuously supplies control frames and the run loop cannot drain. */
@@ -460,7 +467,7 @@ NSURLSessionWebSocketTask *_NSCFURLSessionCreateWebSocketTask(__NSCFURLSession *
     }
     /* Yield the task lock/run loop between bounded batches so command traffic,
      * especially cancellation, cannot be starved by an always-readable peer. */
-    if (!reads && _state == NSURLSessionTaskStateRunning && (_closing || (![_messages count] && !_deliveries)) && [_input hasBytesAvailable])
+    if (!reads && !_protocolFailure && _state == NSURLSessionTaskStateRunning && (_closing || (![_messages count] && !_deliveries)) && [_input hasBytesAvailable])
         [_session _scheduleTask:self];
     /* One completed message plus at most one partial message/read chunk is
      * retained. Stop stream delivery as well as reads, avoiding a hot run loop.
@@ -471,14 +478,42 @@ NSURLSessionWebSocketTask *_NSCFURLSessionCreateWebSocketTask(__NSCFURLSession *
         [_input removeFromRunLoop:[NSRunLoop currentRunLoop] forMode:NSDefaultRunLoopMode]; _inputPaused = YES;
     }
 }
-- (void)_protocolError:(NSString *)description
+- (void)_protocolError:(NSString *)description closeCode:(uint16_t)code
 {
-    [self _finish:webSocketError(NSURLErrorBadServerResponse, description)];
+    if (_protocolFailure) return;
+    NSError *error = webSocketError(NSURLErrorBadServerResponse, description);
+    if (!_upgraded || _closeSent) { [self _finish:error]; return; }
+    _protocolFailure = [error retain];
+    _closing = YES;
+    /* Finish an already-started wire frame, discard unsent application data,
+     * then drain a masked RFC 6455 failure Close before ending the transport.
+     * A blocked peer still has the ordinary bounded close deadline. */
+    NSUInteger keep = [_writes count] && ((__NSCFWebSocketWrite *)[_writes objectAtIndex:0])->offset ? 1 : 0;
+    while ([_writes count] > keep) {
+        __NSCFWebSocketWrite *write = [_writes objectAtIndex:keep];
+        if (write->completion) {
+            void (^completion)(NSError *) = [[write->completion copy] autorelease];
+            [_session addDelegateBlock:^{ completion(error); }];
+        }
+        [_writes removeObjectAtIndex:keep];
+    }
+    if (!keep || !((__NSCFWebSocketWrite *)[_writes objectAtIndex:0])->closeFrame) {
+        uint8_t payload[2] = { code >> 8, code };
+        [self _frame:8 data:[NSData dataWithBytes:payload length:sizeof(payload)] completion:nil];
+    }
+    if (_scheduled && !_inputPaused) {
+        [_input removeFromRunLoop:[NSRunLoop currentRunLoop] forMode:NSDefaultRunLoopMode];
+        _inputPaused = YES;
+    }
+    [_incoming setLength:0]; _incomingOffset = 0;
+    [_fragment release]; _fragment = nil; _fragmentOpcode = 0;
+    _closeTimerStarted = YES; [self _setTimeout:5];
+    [self _flush];
 }
 - (void)_consume
 {
     if (!_upgraded) {
-        if ([_incoming length] > 65536) { [self _protocolError:@"WebSocket upgrade headers exceed 64 KiB"]; return; }
+        if ([_incoming length] > 65536) { [self _protocolError:@"WebSocket upgrade headers exceed 64 KiB" closeCode:1002]; return; }
         const uint8_t *bytes = [_incoming bytes]; NSUInteger length = [_incoming length], end = 0;
         for (NSUInteger i = 3; i < length; ++i) if (bytes[i-3] == '\r' && bytes[i-2] == '\n' && bytes[i-1] == '\r' && bytes[i] == '\n') { end = i + 1; break; }
         if (!end) return;
@@ -499,7 +534,7 @@ NSURLSessionWebSocketTask *_NSCFURLSessionCreateWebSocketTask(__NSCFURLSession *
         NSDictionary *fields = [(id)CFHTTPMessageCopyAllHeaderFields(response) autorelease];
         _response = [[NSHTTPURLResponse alloc] initWithURL:[_request URL] statusCode:CFHTTPMessageGetResponseStatusCode(response) HTTPVersion:@"HTTP/1.1" headerFields:fields];
         CFRelease(response);
-        if (!valid) { [self _protocolError:@"The server did not provide a valid WebSocket HTTP upgrade"]; return; }
+        if (!valid) { [self _protocolError:@"The server did not provide a valid WebSocket HTTP upgrade" closeCode:1002]; return; }
         _upgraded = YES; _incomingOffset = end; [self _setTimeout:_closing ? 5 : 0];
         id delegate = self.delegate; __NSCFURLSession *session = _session;
         if ([delegate respondsToSelector:@selector(URLSession:webSocketTask:didOpenWithProtocol:)]) [session addDelegateBlock:^{ [delegate URLSession:session webSocketTask:self didOpenWithProtocol:protocol]; }];
@@ -510,19 +545,20 @@ NSURLSessionWebSocketTask *_NSCFURLSessionCreateWebSocketTask(__NSCFURLSession *
         if (available < 2) break;
         uint8_t opcode = bytes[0] & 15; BOOL final = bytes[0] & 0x80; uint64_t length = bytes[1] & 127; NSUInteger header = 2;
         if (!_closing && opcode < 8 && ([_messages count] || _deliveries)) break;
-        if ((bytes[0] & 0x70) || (bytes[1] & 0x80) || (opcode > 2 && opcode < 8) || opcode > 10) { [self _protocolError:@"Invalid WebSocket frame flags or opcode"]; return; }
-        if (length == 126) { if (available < 4) break; length = ((uint16_t)bytes[2] << 8) | bytes[3]; header = 4; if (length < 126) { [self _protocolError:@"Noncanonical WebSocket length"]; return; } }
-        else if (length == 127) { if (available < 10) break; length = 0; for (int i = 2; i < 10; ++i) length = (length << 8) | bytes[i]; header = 10; if (length <= 65535 || (length >> 63)) { [self _protocolError:@"Invalid WebSocket 64-bit length"]; return; } }
-        if (opcode >= 8 && (!final || length > 125)) { [self _protocolError:@"Invalid WebSocket control frame"]; return; }
-        if (opcode < 8 && (length >= (uint64_t)_maximum || [_fragment length] >= (uint64_t)_maximum - length)) { [self _protocolError:@"WebSocket message reaches maximumMessageSize"]; return; }
+        if ((bytes[0] & 0x70) || (bytes[1] & 0x80) || (opcode > 2 && opcode < 8) || opcode > 10) { [self _protocolError:@"Invalid WebSocket frame flags or opcode" closeCode:1002]; return; }
+        if (length == 126) { if (available < 4) break; length = ((uint16_t)bytes[2] << 8) | bytes[3]; header = 4; if (length < 126) { [self _protocolError:@"Noncanonical WebSocket length" closeCode:1002]; return; } }
+        else if (length == 127) { if (available < 10) break; length = 0; for (int i = 2; i < 10; ++i) length = (length << 8) | bytes[i]; header = 10; if (length <= 65535 || (length >> 63)) { [self _protocolError:@"Invalid WebSocket 64-bit length" closeCode:1002]; return; } }
+        if (opcode >= 8 && (!final || length > 125)) { [self _protocolError:@"Invalid WebSocket control frame" closeCode:1002]; return; }
+        if (opcode < 8 && (length >= (uint64_t)_maximum || [_fragment length] >= (uint64_t)_maximum - length)) { [self _protocolError:@"WebSocket message reaches maximumMessageSize" closeCode:1009]; return; }
         if (length > available - header) break;
         NSData *payload = [NSData dataWithBytes:bytes + header length:(NSUInteger)length]; _incomingOffset += header + length;
         if (opcode == 8) {
-            if (length == 1) { [self _protocolError:@"Invalid WebSocket close payload"]; return; }
+            if (length == 1) { [self _protocolError:@"Invalid WebSocket close payload" closeCode:1002]; return; }
             NSUInteger code = length ? ((uint16_t)bytes[header] << 8) | bytes[header+1] : 1005;
             NSData *reason = length > 2 ? [payload subdataWithRange:NSMakeRange(2, length - 2)] : nil;
             NSString *text = reason ? [[[NSString alloc] initWithData:reason encoding:NSUTF8StringEncoding] autorelease] : @"";
-            if ((length && !webSocketCloseCode(code)) || !text) { [self _protocolError:@"Invalid WebSocket close code or UTF-8 reason"]; return; }
+            if (length && !webSocketCloseCode(code)) { [self _protocolError:@"Invalid WebSocket close code" closeCode:1002]; return; }
+            if (!text) { [self _protocolError:@"Invalid WebSocket UTF-8 close reason" closeCode:1007]; return; }
             _closeCode = code; _closeReason = [reason copy]; _closeReceived = YES;
             if (!_closing) {
                 _closing = YES;
@@ -550,14 +586,14 @@ NSURLSessionWebSocketTask *_NSCFURLSessionCreateWebSocketTask(__NSCFURLSession *
             }
         } else {
             if (_closing) continue;
-            if ((opcode == 0 && !_fragmentOpcode) || (opcode != 0 && _fragmentOpcode)) { [self _protocolError:@"Invalid WebSocket continuation sequence"]; return; }
+            if ((opcode == 0 && !_fragmentOpcode) || (opcode != 0 && _fragmentOpcode)) { [self _protocolError:@"Invalid WebSocket continuation sequence" closeCode:1002]; return; }
             if (opcode) { _fragmentOpcode = opcode; _fragment = [[NSMutableData alloc] init]; }
             [_fragment appendData:payload];
             if (final) {
                 NSURLSessionWebSocketMessage *message;
                 if (_fragmentOpcode == 1) {
                     NSString *text = [[[NSString alloc] initWithData:_fragment encoding:NSUTF8StringEncoding] autorelease];
-                    if (!text) { [self _protocolError:@"WebSocket text is not valid UTF-8"]; return; }
+                    if (!text) { [self _protocolError:@"WebSocket text is not valid UTF-8" closeCode:1007]; return; }
                     message = [[[NSURLSessionWebSocketMessage alloc] initWithString:text] autorelease];
                 } else message = [[[NSURLSessionWebSocketMessage alloc] initWithData:_fragment] autorelease];
                 [_fragment release]; _fragment = nil; _fragmentOpcode = 0;
