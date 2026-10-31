@@ -1791,6 +1791,7 @@ _SocketCallBack(CFSocketRef s, CFSocketCallBackType type, CFDataRef address, con
 					 * descriptor exactly as _SocketStreamRead already does
 					 * when it converts the wait into has-bytes. */
 					if (ctxt->_socket && CFSocketIsValid(ctxt->_socket) && !_CFSocketCan(ctxt->_socket, kSelectModeRead)) {
+						CFSocketEnableCallBacks(ctxt->_socket, kCFSocketReadCallBack);
 						break;
 					}
 					__CFBitSet(ctxt->_flags, kFlagBitCanRead);
