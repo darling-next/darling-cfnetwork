@@ -786,10 +786,23 @@ _SocketStreamRead(CFReadStreamRef stream, UInt8* buffer, CFIndex bufferLength,
 				
 				CFDictionaryRemoveValue(ctxt->_properties, _kCFStreamPropertyReadCancel);
 				
-				/* If fell out, still not time, and no error, set to timed out. */
+				/* If fell out, still not time, and no error, set to timed out.
+				 * A CFSocket event can be coalesced or enabled/disabled out from
+				 * under a scheduled source (see _CFSocketCan's comment), so the
+				 * run loop expiring is not proof that the descriptor is idle.
+				 * Double-check the descriptor before converting the internal
+				 * 0.5 s readiness wait into a fatal stream error: reporting
+				 * ETIMEDOUT for a readable socket blackholes the caller even
+				 * though the next read would have succeeded. */
 				if (!__CFBitIsSet(ctxt->_flags, kFlagBitCanRead) && !ctxt->_error.error) {				
-					ctxt->_error.error = ETIMEDOUT;
-					ctxt->_error.domain = kCFStreamErrorDomainPOSIX;
+					if (ctxt->_socket && CFSocketIsValid(ctxt->_socket) && _CFSocketCan(ctxt->_socket, kSelectModeRead)) {
+						__CFBitSet(ctxt->_flags, kFlagBitCanRead);
+						__CFBitClear(ctxt->_flags, kFlagBitPollRead);
+					}
+					else {
+						ctxt->_error.error = ETIMEDOUT;
+						ctxt->_error.domain = kCFStreamErrorDomainPOSIX;
+					}
 				}
 			}
 			else {
@@ -1054,10 +1067,19 @@ _SocketStreamWrite(CFWriteStreamRef stream, const UInt8* buffer, CFIndex bufferL
 				
 				CFDictionaryRemoveValue(ctxt->_properties, _kCFStreamPropertyWriteCancel);
 				
-				/* If fell out, still not time, and no error, set to timed out. */
+				/* If fell out, still not time, and no error, set to timed out.
+				 * Mirror the read path: a missed CFSocket event must not turn a
+				 * writable descriptor into a fatal ETIMEDOUT. Re-check the fd
+				 * and only report a timeout when it is genuinely not ready. */
 				if (!__CFBitIsSet(ctxt->_flags, kFlagBitCanWrite) && !ctxt->_error.error) {				
-					ctxt->_error.error = ETIMEDOUT;
-					ctxt->_error.domain = kCFStreamErrorDomainPOSIX;
+					if (ctxt->_socket && CFSocketIsValid(ctxt->_socket) && _CFSocketCan(ctxt->_socket, kSelectModeWrite)) {
+						__CFBitSet(ctxt->_flags, kFlagBitCanWrite);
+						__CFBitClear(ctxt->_flags, kFlagBitPollWrite);
+					}
+					else {
+						ctxt->_error.error = ETIMEDOUT;
+						ctxt->_error.domain = kCFStreamErrorDomainPOSIX;
+					}
 				}
 			}
 			else {
