@@ -6291,12 +6291,16 @@ _SocketStreamSecuritySetInfo_NoLock(_CFSocketStreamContext* ctxt, CFDictionaryRe
         if (SSLNewContext((value && CFEqual(value, kCFBooleanTrue)), &security))
             break;
 		
-		/* Figure out the correct security level to set and set it. */
+		/* Figure out the correct security level to set and set it.
+		 * NegotiatedSSL (also the default when no level is supplied) means
+		 * "the highest version both peers support"; the freshly created
+		 * context already enables every version SecureTransport implements.
+		 * Capping it with SSLSetProtocolVersion(kTLSProtocol1) instead limited
+		 * the maximum to TLS 1.0, so a peer that requires TLS 1.2 closed the
+		 * connection during negotiation, before the certificate could be
+		 * exchanged or validated. */
         value = CFDictionaryGetValue(settings, kCFStreamSSLLevel);
-        if ((!value || CFEqual(value, kCFStreamSocketSecurityLevelNegotiatedSSL)) && SSLSetProtocolVersion(security, kTLSProtocol1))
-            break;
-
-        else if (value) {
+        if (value && !CFEqual(value, kCFStreamSocketSecurityLevelNegotiatedSSL)) {
                 
             if (CFEqual(value, kCFStreamSocketSecurityLevelNone)) {
                 SSLDisposeContext(security);
